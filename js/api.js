@@ -22,7 +22,7 @@ import {
 import { APICache } from './cache.js';
 import { DashDownloader } from './dash-downloader.ts';
 import { HlsDownloader } from './hls-downloader.js';
-import { getProxyUrl, wrapTidalUrl } from './proxy-utils.js';
+import { fetchDownload, getProxyUrl, wrapTidalUrl } from './proxy-utils.js';
 import { loadFfmpeg, FfmpegError, ffmpeg } from './ffmpeg.js';
 import { triggerDownload, applyAudioPostProcessing } from './download-utils.ts';
 import { isCustomFormat } from './ffmpegFormats.ts';
@@ -3021,6 +3021,188 @@ export class LosslessAPI {
         return result;
     }
 
+    getDownloadQualityLadder(quality) {
+        const normalized = normalizeQualityToken(quality) || quality || 'LOSSLESS';
+        if (isAtmosQuality(normalized)) return [normalized, 'HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH'];
+        if (normalized === 'HI_RES_LOSSLESS') return ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
+        if (normalized === 'LOSSLESS') return ['LOSSLESS', 'HIGH', 'LOW'];
+        if (normalized === 'HIGH' || normalized === 'NORMAL') return [normalized, 'LOW'];
+        return [normalized, 'LOSSLESS', 'HIGH', 'LOW'];
+    }
+
+    dropCachedStreams(id) {
+        const needle = String(id || '');
+        if (!needle) return;
+        for (const key of this.streamCache.keys()) {
+            if (key.includes(needle)) this.streamCache.delete(key);
+        }
+    }
+
+    streamKind(url, playbackType) {
+        const value = `${playbackType || ''} ${url || ''}`.toLowerCase();
+        if (value.includes('m3u8') || value.includes('mpegurl') || value.includes('hls')) return 'hls';
+        if (value.includes('dash') || value.includes('.mpd') || url?.startsWith('blob:') || url?.startsWith('data:')) {
+            return 'dash';
+        }
+        return 'direct';
+    }
+
+    /**
+     * Yields stream URLs this client can already resolve for one quality.
+     * The next source is looked up only after the previous download fails.
+     */
+    async *iterateDownloadSources(id, quality, track, prepared, seen) {
+        const yieldNew = function* (source) {
+            const url = source?.url;
+            if (!url || seen.has(url)) return;
+            seen.add(url);
+            yield source;
+        };
+
+        if (prepared?.externalStreamUrl) {
+            yield* yieldNew({
+                url: prepared.externalStreamUrl,
+                playbackType: prepared.externalStreamType,
+                provider: prepared.externalProvider || 'monochrome',
+                quality: prepared.lookup?.info?.audioQuality || quality,
+                label: 'monochrome',
+            });
+        } else if (prepared?.lookup?.originalTrackUrl) {
+            yield* yieldNew({
+                url: prepared.lookup.originalTrackUrl,
+                playbackType: 'direct',
+                provider: 'manifest',
+                quality,
+                label: 'manifest',
+            });
+        } else if (!prepared) {
+            try {
+                const stream = await tracksStreamerAPI.resolveTrackStream(id, quality, { track });
+                if (stream?.url) {
+                    yield* yieldNew({
+                        url: stream.url,
+                        playbackType: stream.playbackType,
+                        provider: stream.provider || 'monochrome',
+                        quality: stream.quality || quality,
+                        label: 'monochrome',
+                    });
+                }
+            } catch (error) {
+                console.warn(`Monochrome stream lookup failed for ${id}:`, error);
+            }
+        }
+
+        try {
+            const lookup = await this.getTrack(id, quality);
+            let url = lookup?.originalTrackUrl || null;
+            if (!url && lookup?.info?.manifest) {
+                url = this.extractStreamUrlFromManifest(lookup.info.manifest);
+            }
+            if (url) {
+                yield* yieldNew({
+                    url,
+                    playbackType: this.streamKind(url),
+                    provider: 'streaming',
+                    quality: lookup?.info?.audioQuality || quality,
+                    label: 'streaming-api',
+                });
+            }
+        } catch (error) {
+            console.warn(`Streaming API lookup failed for ${id} (${quality}):`, error?.message || error);
+        }
+
+        const isrc = track?.isrc;
+        if (isrc && deezerFallbackSettings.isEnabled()) {
+            const baseUrl = deezerFallbackSettings.getApiBaseUrl().replace(/\/+$/, '');
+            if (baseUrl) {
+                const format = this.getDeezerStreamFormat(quality);
+                yield* yieldNew({
+                    url: `${baseUrl}/stream/?isrc=${encodeURIComponent(isrc)}&format=${encodeURIComponent(format)}`,
+                    playbackType: 'direct',
+                    provider: 'deezer',
+                    quality,
+                    label: 'deezer',
+                });
+            }
+        }
+
+        try {
+            const unified = await this.getUnifiedPlaybackStreamUrl(id, quality, { track, intent: 'download' });
+            if (unified?.url) {
+                yield* yieldNew({
+                    url: unified.url,
+                    playbackType: unified.playbackType,
+                    provider: unified.provider || 'unified',
+                    quality: unified.quality || quality,
+                    label: 'unified',
+                });
+            }
+        } catch (error) {
+            console.warn(`Unified playback lookup failed for ${id}:`, error?.message || error);
+        }
+    }
+
+    async assertUsableMedia(blob) {
+        if (!blob || blob.size < 128) {
+            throw new Error('Download response was empty');
+        }
+        const head = new Uint8Array(await blob.slice(0, 64).arrayBuffer());
+        const text = new TextDecoder().decode(head).trimStart().toLowerCase();
+        if (
+            text.startsWith('<!doctype') ||
+            text.startsWith('<html') ||
+            text.startsWith('{') ||
+            text.startsWith('[') ||
+            text.startsWith('<?xml')
+        ) {
+            throw new Error('Download response was not an audio file');
+        }
+    }
+
+    async downloadDirectStream(streamUrl, { signal, onProgress, isVideo }) {
+        const response = await fetchDownload(getProxyUrl(streamUrl), { signal, attempts: 3 });
+        const contentLengthHeader = response.headers.get('Content-Length');
+        const totalBytes = resolveDownloadTotalBytes(contentLengthHeader, null);
+        let receivedBytes = 0;
+
+        if (response.body) {
+            const chunks = [];
+            for await (const chunk of readableStreamIterator(response.body)) {
+                chunks.push(chunk);
+                receivedBytes += chunk.byteLength;
+                onProgress?.(new DownloadProgress(receivedBytes, totalBytes || undefined));
+            }
+            const defaultMime = isVideo ? 'video/mp4' : 'audio/flac';
+            return new Blob(chunks, { type: response.headers.get('Content-Type') || defaultMime });
+        }
+
+        onProgress?.(new DownloadProgress(0, undefined));
+        const blob = await response.blob();
+        onProgress?.(new DownloadProgress(blob.size, blob.size));
+        return blob;
+    }
+
+    async downloadSourceBlob(source, { signal, onProgress, isVideo, calculateDashBytes }) {
+        const streamUrl = source.url;
+        const kind = this.streamKind(streamUrl, source.playbackType);
+
+        if (kind === 'dash') {
+            const downloader = new DashDownloader();
+            return downloader.downloadDashStream(getProxyUrl(streamUrl), {
+                signal,
+                onProgress,
+                calculateDashBytes: calculateDashBytes ?? true,
+            });
+        }
+
+        if (kind === 'hls') {
+            const downloader = new HlsDownloader();
+            return downloader.downloadHlsStream(getProxyUrl(streamUrl), { signal, onProgress });
+        }
+
+        return this.downloadDirectStream(streamUrl, { signal, onProgress, isVideo });
+    }
+
     /**
      * Downloads a track or video from TIDAL in the specified quality.
      *
@@ -3064,166 +3246,92 @@ export class LosslessAPI {
 
             const inputTrackObj = options.track || (typeof inputTrack === 'object' ? inputTrack : null);
             const legacyEnrichedInput = inputTrackObj?.enrichedTrack && inputTrackObj?.lookup ? inputTrackObj : null;
-            const enriched =
-                options.enriched ||
-                legacyEnrichedInput ||
-                (await this.enrichTrack(inputTrackObj || id, { downloadQuality }));
-            const { lookup, enrichedTrack, isVideo } = enriched;
+            let enriched = options.enriched || legacyEnrichedInput || null;
+            if (!enriched) {
+                try {
+                    enriched = await this.enrichTrack(inputTrackObj || id, { downloadQuality });
+                } catch (enrichError) {
+                    console.warn('Track enrichment failed, continuing with alternate download sources:', enrichError);
+                }
+            }
+            const enrichedTrack = enriched?.enrichedTrack || inputTrackObj;
+            const isVideo = Boolean(enriched?.isVideo || enrichedTrack?.type?.toLowerCase?.().includes('video'));
 
-            let streamUrl = enriched.externalStreamUrl || null;
-            let postProcessingQuality = lookup.info?.audioQuality ?? null;
-            let blob;
-
-            if (streamUrl) {
-                const coverId = getTrackCoverId(enrichedTrack);
+            const coverId = enrichedTrack ? getTrackCoverId(enrichedTrack) : null;
+            try {
+                prefetchPromises = enriched?.externalStreamUrl
+                    ? {
+                          coverFetch: coverId ? getCoverBlob(this, coverId).catch(() => null) : Promise.resolve(null),
+                          lyricsFetch: Promise.resolve(null),
+                      }
+                    : prefetchMetadataObjects(enrichedTrack, this);
+            } catch (prefetchError) {
+                console.warn('Metadata prefetch failed:', prefetchError);
                 prefetchPromises = {
-                    coverFetch: coverId ? getCoverBlob(this, coverId).catch(() => null) : Promise.resolve(null),
+                    coverFetch: Promise.resolve(null),
                     lyricsFetch: Promise.resolve(null),
                 };
-            } else {
-                prefetchPromises = prefetchMetadataObjects(enrichedTrack, this);
             }
 
-            if (!streamUrl) {
-                if (lookup.originalTrackUrl) {
-                    streamUrl = lookup.originalTrackUrl;
-                } else {
-                    const findValue = (obj, key) => {
-                        if (!obj || typeof obj !== 'object') return null;
-                        if (obj[key]) return obj[key];
-                        for (const v of Object.values(obj)) {
-                            if (v && typeof v === 'object') {
-                                const f = findValue(v, key);
-                                if (f) return f;
-                            }
+            const seenUrls = new Set();
+            const qualities = isVideo ? [downloadQuality] : this.getDownloadQualityLadder(downloadQuality);
+            let blob = null;
+            let postProcessingQuality = enriched?.lookup?.info?.audioQuality ?? null;
+            let lastDownloadError = null;
+
+            for (let pass = 1; pass <= 2 && !blob; pass++) {
+                if (pass > 1) {
+                    this.dropCachedStreams(id);
+                    tracksStreamerAPI.resolutionCache?.clear();
+                    seenUrls.clear();
+                    console.warn(`Retrying download for ${id} from the start (pass ${pass})`);
+                    await delay(800 * pass);
+                }
+
+                for (const candidateQuality of qualities) {
+                    if (options.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+
+                    const prepared = candidateQuality === downloadQuality ? enriched : null;
+
+                    for await (const source of this.iterateDownloadSources(
+                        id,
+                        candidateQuality,
+                        enrichedTrack,
+                        prepared,
+                        seenUrls
+                    )) {
+                        if (options.signal?.aborted) {
+                            throw new DOMException('The operation was aborted.', 'AbortError');
                         }
-                        return null;
-                    };
-
-                    const manifest = isVideo
-                        ? findValue(lookup, 'manifest') || findValue(lookup, 'Manifest')
-                        : lookup.info?.manifest;
-
-                    if (!manifest) {
-                        throw new Error('Could not resolve manifest');
-                    }
-
-                    if (preferDolbyAtmosSettings.isEnabled() && enrichedTrack.audioModes?.includes('DOLBY_ATMOS')) {
+                        console.info(`Downloading ${id} via ${source.label} at ${candidateQuality}`);
                         try {
-                            const stream = await this.getStreamUrl(id, 'DOLBY_ATMOS_EAC3_HIGH');
-                            const manifestRes = await fetch(stream.url, { signal: options.signal });
-                            const manifestText = await manifestRes.text();
-                            streamUrl = this.extractStreamUrlFromManifest(btoa(manifestText));
-
-                            if (streamUrl) {
-                                postProcessingQuality = 'DOLBY_ATMOS_EAC3_HIGH';
-                            }
-                        } catch (err) {
-                            console.error('Failed to extract Dolby Atmos stream URL:', err);
+                            blob = await this.downloadSourceBlob(source, {
+                                signal: options.signal,
+                                onProgress,
+                                isVideo,
+                                calculateDashBytes,
+                            });
+                            await this.assertUsableMedia(blob);
+                            postProcessingQuality = source.quality || candidateQuality;
+                            break;
+                        } catch (sourceError) {
+                            if (sourceError?.name === 'AbortError') throw sourceError;
+                            lastDownloadError = sourceError;
+                            this.dropCachedStreams(id);
+                            console.warn(
+                                `Download source ${source.label} failed for ${id} (${candidateQuality}):`,
+                                sourceError?.message || sourceError
+                            );
                         }
                     }
 
-                    if (!streamUrl) {
-                        streamUrl = this.extractStreamUrlFromManifest(manifest);
-                        if (!streamUrl) {
-                            throw new Error('Could not resolve stream URL');
-                        }
-                    }
+                    if (blob) break;
+                    console.warn(`No usable file for ${id} at ${candidateQuality}. Trying the next quality.`);
                 }
             }
 
-            if (
-                streamUrl.startsWith('blob:') ||
-                streamUrl.startsWith('data:') ||
-                enriched.externalStreamType?.includes('dash') ||
-                streamUrl.includes('.mpd')
-            ) {
-                try {
-                    const downloader = new DashDownloader();
-                    blob = await downloader.downloadDashStream(getProxyUrl(streamUrl), {
-                        signal: options.signal,
-                        onProgress,
-                        calculateDashBytes: calculateDashBytes ?? true,
-                    });
-                } catch (dashError) {
-                    console.error('DASH download failed:', dashError);
-                    if (isVideo) throw dashError;
-
-                    // Fallback to LOSSLESS if DASH fails, but not if we're already downloading LOSSLESS
-                    if (downloadQuality !== 'LOSSLESS' && !isAtmosQuality(downloadQuality)) {
-                        console.warn('Falling back to LOSSLESS (16-bit) download.');
-                        return this.downloadTrack(id, 'LOSSLESS', filename, {
-                            ...options,
-                            // The previous resolution belongs to a different strict
-                            // quality and may contain a one-use playback URL.
-                            track: options.track?.enrichedTrack || options.track,
-                            enriched: undefined,
-                        });
-                    }
-                    throw dashError;
-                }
-            } else if (streamUrl.includes('.m3u8') || streamUrl.includes('application/vnd.apple.mpegurl')) {
-                try {
-                    const downloader = new HlsDownloader();
-                    blob = await downloader.downloadHlsStream(getProxyUrl(streamUrl), {
-                        signal: options.signal,
-                        onProgress,
-                    });
-                } catch (hlsError) {
-                    console.error('HLS download failed:', hlsError);
-                    throw hlsError;
-                }
-            } else {
-                // Try HEAD first to get Content-Length when GET uses chunked encoding (fixes #278)
-                let headContentLength = null;
-                // Monochrome playback URLs may be single-use, so the download GET must be the first request.
-                if (enriched.externalProvider !== 'monochrome') {
-                    try {
-                        const headResponse = await fetch(streamUrl, {
-                            method: 'HEAD',
-                            cache: 'no-store',
-                            signal: options.signal,
-                        });
-                        if (headResponse.ok) {
-                            const cl = headResponse.headers.get('Content-Length');
-                            if (cl) headContentLength = parseInt(cl, 10);
-                        }
-                    } catch (_) {
-                        /* ignore HEAD failure; proceed with GET */
-                    }
-                }
-
-                const response = await fetch(getProxyUrl(streamUrl), {
-                    cache: 'no-store',
-                    signal: options.signal,
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Fetch failed: ${response.status}`);
-                }
-
-                const contentLengthHeader = response.headers.get('Content-Length');
-                const totalBytes = resolveDownloadTotalBytes(contentLengthHeader, headContentLength);
-
-                let receivedBytes = 0;
-
-                if (response.body) {
-                    const chunks = [];
-
-                    for await (const chunk of readableStreamIterator(response.body)) {
-                        chunks.push(chunk);
-                        receivedBytes += chunk.byteLength;
-
-                        onProgress?.(new DownloadProgress(receivedBytes, totalBytes || undefined));
-                    }
-
-                    const defaultMime = isVideo ? 'video/mp4' : 'audio/flac';
-                    blob = new Blob(chunks, { type: response.headers.get('Content-Type') || defaultMime });
-                } else {
-                    onProgress?.(new DownloadProgress(0, undefined));
-                    blob = await response.blob();
-                    onProgress?.(new DownloadProgress(blob.size, blob.size));
-                }
+            if (!blob) {
+                throw lastDownloadError || new Error('Could not resolve stream URL');
             }
 
             if (!isVideo) {

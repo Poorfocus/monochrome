@@ -1,6 +1,6 @@
 import { AbortError } from './errorTypes';
 import { SegmentedDownloadProgress } from './progressEvents';
-import { getProxyUrl } from './proxy-utils';
+import { fetchDownload, getProxyUrl } from './proxy-utils';
 
 export interface DashDownloadOptions {
     onProgress?: MonochromeProgressListener<SegmentedDownloadProgress>;
@@ -52,7 +52,7 @@ export class DashDownloader {
         const { onProgress, signal, calculateDashBytes = true } = options;
 
         // 1. Fetch and Parse Manifest
-        const response = await fetch(manifestBlobUrl);
+        const response = await fetchDownload(manifestBlobUrl, { signal, attempts: 3 });
         const manifestText = await response.text();
 
         const manifest = this.parseManifest(manifestText);
@@ -76,27 +76,17 @@ export class DashDownloader {
 
             onProgress?.(new SegmentedDownloadProgress(downloadedBytes, totalSize ?? undefined, i, totalSegments));
 
-            const url = getProxyUrl(urls[i]);
-            const segmentResponse = await fetch(url, { signal });
-
-            if (!segmentResponse.ok) {
-                console.warn(`Failed to fetch segment ${i}, retrying...`);
-                await new Promise((r) => setTimeout(r, 1000));
-
-                const retryResponse = await fetch(url, { signal });
-
-                if (!retryResponse.ok) {
-                    throw new Error(`Failed to fetch segment ${i}: ${retryResponse.status}`);
-                }
-
-                const chunk = await retryResponse.arrayBuffer();
-                chunks.push(chunk);
-                downloadedBytes += chunk.byteLength;
-            } else {
-                const chunk = await segmentResponse.arrayBuffer();
-                chunks.push(chunk);
-                downloadedBytes += chunk.byteLength;
+            let segmentResponse;
+            try {
+                segmentResponse = await fetchDownload(getProxyUrl(urls[i]), { signal, attempts: 3 });
+            } catch (error: any) {
+                if (error?.name === 'AbortError') throw error;
+                throw new Error(`Failed to fetch segment ${i}: ${error?.message || error}`);
             }
+
+            const chunk = await segmentResponse.arrayBuffer();
+            chunks.push(chunk);
+            downloadedBytes += chunk.byteLength;
 
             onProgress?.(new SegmentedDownloadProgress(downloadedBytes, totalSize ?? undefined, i + 1, totalSegments));
         }

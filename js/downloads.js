@@ -1174,16 +1174,15 @@ export async function downloadTrackWithMetadata(
     // cannot start multiple enrichments for the same track.
     ongoingDownloads.add(downloadKey);
 
-    let enriched;
+    let enriched = null;
     try {
         enriched = await tidalAPI.enrichTrack(track, { downloadQuality: quality });
     } catch (error) {
-        ongoingDownloads.delete(downloadKey);
-        const title = track?.title || track?.name || 'this track';
-        showNotification(`Couldn't download "${title}": ${friendlyEnrichError(error)}`);
-        return;
+        console.warn(
+            `Enrichment failed before download (${friendlyEnrichError(error)}). Trying alternate sources.`
+        );
     }
-    const { enrichedTrack } = enriched;
+    const enrichedTrack = enriched?.enrichedTrack || track;
     const filename = buildTrackFilename(enrichedTrack, quality);
 
     try {
