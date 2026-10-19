@@ -1,0 +1,41 @@
+name: Desktop Release
+
+on:
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+jobs:
+    windows:
+        runs-on: windows-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: latest
+
+            - name: Install dependencies
+              run: bun install --frozen-lockfile
+
+            - name: Build installer and portable app
+              run: bun run desktop:dist -- --win --publish never
+              env:
+                  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+            - name: Publish release
+              shell: pwsh
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+                  $tag = "desktop-v$version.${{ github.run_number }}"
+                  $files = Get-ChildItem release -Filter *.exe | ForEach-Object { $_.FullName }
+                  if (-not $files) { throw 'No .exe files were built' }
+                  gh release create $tag @files `
+                      --target "${{ github.sha }}" `
+                      --title "Monochrome Desktop $version (Windows)" `
+                      --notes "Windows desktop app. Run the Setup installer, or use the portable .exe without installing. Downloads save straight to Music/Monochrome (change it in Settings -> Downloads). Unsigned build: if Windows SmartScreen warns, choose More info -> Run anyway."
