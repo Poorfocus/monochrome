@@ -218,6 +218,10 @@ bun run desktop:dist   # package an installer into release/
 
 Downloads run one at a time in a queue, and the **Downloads** page shows every album and track with its saved location, a **Show in folder** button and **Retry**. Tracks that fail are retried automatically until they download (cancel or remove the job to stop).
 
+### Download speed
+
+Downloads stream from one of two kinds of host: the monochrome server (default) or the HiFi hosts in `public/instances.json`. To see which is faster on your connection, run `bun run bench:hosts`, then pick **Settings → Downloads → Download Source**. **Simultaneous Track Downloads** controls how many tracks of an album download at once.
+
 ### MCP server
 
 `mcp/` is an MCP server that lets Claude find and download a whole list of albums through the desktop app. See [mcp/README.md](mcp/README.md).

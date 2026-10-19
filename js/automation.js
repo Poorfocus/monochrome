@@ -3,6 +3,7 @@ import { MusicAPI } from './music-api.js';
 import { LyricsManager } from './lyrics.js';
 import { downloadQualitySettings } from './storage.js';
 import {
+    fellBackTo16Bit,
     getDownloadJobs,
     cancelDownloadJob,
     clearFinishedDownloads,
@@ -159,6 +160,7 @@ async function searchAlbums(query, limit = 10) {
 
 function jobSummary(job, jobs) {
     const { done, failed, total } = summarizeJob(job);
+    const fellBack = job.items.filter((item) => fellBackTo16Bit(job, item)).length;
     return {
         jobId: job.id,
         kind: job.kind,
@@ -167,6 +169,7 @@ function jobSummary(job, jobs) {
         status: job.status,
         tracksDone: done,
         tracksFailed: failed,
+        ...(fellBack ? { tracksSavedIn16BitBecauseNoHiRes: fellBack } : {}),
         tracksTotal: total,
         ...(job.status === 'queued' ? { queuePosition: queuePosition(job.id, jobs) } : {}),
         ...(failed

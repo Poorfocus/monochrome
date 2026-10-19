@@ -24,6 +24,7 @@ import { DashDownloader } from './dash-downloader.ts';
 import { HlsDownloader } from './hls-downloader.js';
 import { fetchDownload, getProxyUrl, wrapTidalUrl } from './proxy-utils.js';
 import { loadFfmpeg, FfmpegError, ffmpeg } from './ffmpeg.js';
+import { modernSettings } from './ModernSettings.js';
 import { triggerDownload, applyAudioPostProcessing } from './download-utils.ts';
 import { isCustomFormat } from './ffmpegFormats.ts';
 import { DownloadProgress } from './progressEvents.js';
@@ -3021,13 +3022,19 @@ export class LosslessAPI {
         return result;
     }
 
+    /**
+     * Qualities to try for one track, best first. A track that can't be had
+     * in the chosen quality steps down to 16-bit lossless, never to lossy
+     * AAC: a lossy file would count as a success and never be retried.
+     */
     getDownloadQualityLadder(quality) {
         const normalized = normalizeQualityToken(quality) || quality || 'LOSSLESS';
-        if (isAtmosQuality(normalized)) return [normalized, 'HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH'];
-        if (normalized === 'HI_RES_LOSSLESS') return ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-        if (normalized === 'LOSSLESS') return ['LOSSLESS', 'HIGH', 'LOW'];
+        if (isAtmosQuality(normalized)) return [normalized, 'HI_RES_LOSSLESS', 'LOSSLESS'];
+        if (normalized === 'HI_RES_LOSSLESS') return ['HI_RES_LOSSLESS', 'LOSSLESS'];
+        if (normalized === 'LOSSLESS') return ['LOSSLESS'];
         if (normalized === 'HIGH' || normalized === 'NORMAL') return [normalized, 'LOW'];
-        return [normalized, 'LOSSLESS', 'HIGH', 'LOW'];
+        if (normalized === 'LOW') return ['LOW'];
+        return [normalized, 'LOSSLESS'];
     }
 
     dropCachedStreams(id) {
@@ -3077,56 +3084,14 @@ export class LosslessAPI {
             return;
         }
 
-        if (prepared?.externalStreamUrl) {
-            yield* yieldNew({
-                url: prepared.externalStreamUrl,
-                playbackType: prepared.externalStreamType,
-                provider: prepared.externalProvider || 'monochrome',
-                quality: prepared.lookup?.info?.audioQuality || quality,
-                label: 'monochrome',
-            });
-        } else if (prepared?.lookup?.originalTrackUrl) {
-            yield* yieldNew({
-                url: prepared.lookup.originalTrackUrl,
-                playbackType: 'direct',
-                provider: 'manifest',
-                quality,
-                label: 'manifest',
-            });
-        } else if (!prepared) {
-            try {
-                const stream = await tracksStreamerAPI.resolveTrackStream(id, quality, { track });
-                if (stream?.url) {
-                    yield* yieldNew({
-                        url: stream.url,
-                        playbackType: stream.playbackType,
-                        provider: stream.provider || 'monochrome',
-                        quality: stream.quality || quality,
-                        label: 'monochrome',
-                    });
-                }
-            } catch (error) {
-                console.warn(`Monochrome stream lookup failed for ${id}:`, error);
-            }
-        }
-
-        try {
-            const lookup = await this.getTrack(id, quality);
-            let url = lookup?.originalTrackUrl || null;
-            if (!url && lookup?.info?.manifest) {
-                url = this.extractStreamUrlFromManifest(lookup.info.manifest);
-            }
-            if (url) {
-                yield* yieldNew({
-                    url,
-                    playbackType: this.streamKind(url),
-                    provider: 'streaming',
-                    quality: lookup?.info?.audioQuality || quality,
-                    label: 'streaming-api',
-                });
-            }
-        } catch (error) {
-            console.warn(`Streaming API lookup failed for ${id} (${quality}):`, error?.message || error);
+        // Which host serves the audio first. "Automatic" starts with the monochrome server and
+        // falls back to the HiFi hosts; "hifi-first" does the reverse (try it if downloads are slow).
+        const order =
+            modernSettings.downloadSourcePreference === 'hifi-first'
+                ? ['hifiSources', 'monochromeSources']
+                : ['monochromeSources', 'hifiSources'];
+        for (const name of order) {
+            yield* this[name](id, quality, track, prepared, yieldNew);
         }
 
         const isrc = track?.isrc;
@@ -3158,6 +3123,100 @@ export class LosslessAPI {
         } catch (error) {
             console.warn(`Unified playback lookup failed for ${id}:`, error?.message || error);
         }
+    }
+
+    /** Stream from the monochrome server (tracks.monochrome.st), the catalog the app searches. */
+    async *monochromeSources(id, quality, track, prepared, yieldNew) {
+        if (prepared?.externalStreamUrl) {
+            yield* yieldNew({
+                url: prepared.externalStreamUrl,
+                playbackType: prepared.externalStreamType,
+                provider: prepared.externalProvider || 'monochrome',
+                quality: prepared.lookup?.info?.audioQuality || quality,
+                // The monochrome server only serves 16-bit FLAC, whatever was asked for.
+                delivered: 'LOSSLESS',
+                label: 'monochrome',
+            });
+        } else if (prepared?.lookup?.originalTrackUrl) {
+            yield* yieldNew({
+                url: prepared.lookup.originalTrackUrl,
+                playbackType: 'direct',
+                provider: 'manifest',
+                quality,
+                label: 'manifest',
+            });
+        } else if (!prepared) {
+            try {
+                const stream = await tracksStreamerAPI.resolveTrackStream(id, quality, { track });
+                if (stream?.url) {
+                    yield* yieldNew({
+                        url: stream.url,
+                        playbackType: stream.playbackType,
+                        provider: stream.provider || 'monochrome',
+                        quality: stream.quality || quality,
+                        delivered: 'LOSSLESS',
+                        label: 'monochrome',
+                    });
+                }
+            } catch (error) {
+                console.warn(`Monochrome stream lookup failed for ${id}:`, error);
+            }
+        }
+    }
+
+    /**
+     * Stream from the HiFi hosts: look the track up on a host and download the
+     * link it returns. The hosts know TIDAL IDs, not the catalog's own, so a
+     * catalog track is mapped to its TIDAL ID through its ISRC first.
+     */
+    async *hifiSources(id, quality, track, _prepared, yieldNew) {
+        try {
+            const tidalId = await this.resolveTidalTrackId(id, track);
+            if (!tidalId) {
+                console.warn(`No TIDAL track found for ${id}, skipping the HiFi hosts`);
+                return;
+            }
+            const lookup = await this.getTrack(tidalId, quality);
+            let url = lookup?.originalTrackUrl || null;
+            if (!url && lookup?.info?.manifest) {
+                url = this.extractStreamUrlFromManifest(lookup.info.manifest);
+            }
+            if (url) {
+                yield* yieldNew({
+                    url,
+                    playbackType: this.streamKind(url),
+                    provider: 'streaming',
+                    quality: lookup?.info?.audioQuality || quality,
+                    label: 'streaming-api',
+                });
+            }
+        } catch (error) {
+            console.warn(`Streaming API lookup failed for ${id} (${quality}):`, error?.message || error);
+        }
+    }
+
+    /**
+     * The TIDAL track ID for a track, or null. TIDAL IDs pass through; the
+     * catalog's 17-20 digit IDs are mapped through the track's ISRC.
+     */
+    async resolveTidalTrackId(id, track) {
+        const raw = String(id ?? '').replace(/^(?:tracks|mono):(?:track:)?/, '');
+        const isCatalogId = /^\d{17,20}$/.test(raw) || track?.provider === 'tracks';
+        if (!isCatalogId) return raw || null;
+
+        const isrc = String(track?.isrc || '')
+            .trim()
+            .toUpperCase();
+        if (!isrc) return null;
+        this.tidalIdByIsrc ??= new Map();
+        if (this.tidalIdByIsrc.has(isrc)) return this.tidalIdByIsrc.get(isrc);
+
+        const { items = [] } = await this.searchTracksByIsrc(isrc);
+        const sameIsrc = items.filter((t) => String(t?.isrc || '').toUpperCase() === isrc && t?.id != null);
+        const match = sameIsrc[0] || items.find((t) => t?.id != null) || null;
+        const tidalId = match ? String(match.id) : null;
+        if (tidalId) this.tidalIdByIsrc.set(isrc, tidalId);
+        return tidalId;
     }
 
     async assertUsableMedia(blob) {
@@ -3255,6 +3314,15 @@ export class LosslessAPI {
 
         const { onProgress, track: inputTrack, calculateDashBytes = true } = options;
 
+        // Where the time goes, logged once per track as "[timing] ...".
+        const timing = { start: performance.now(), enrich: 0, download: 0, convert: 0, tag: 0 };
+        let mark = timing.start;
+        const lap = (name) => {
+            const now = performance.now();
+            timing[name] += now - mark;
+            mark = now;
+        };
+
         let prefetchPromises = null;
 
         try {
@@ -3291,6 +3359,7 @@ export class LosslessAPI {
                 };
             }
 
+            lap('enrich');
             const seenUrls = new Set();
             const qualities = isVideo ? [downloadQuality] : this.getDownloadQualityLadder(downloadQuality);
             let blob = null;
@@ -3331,6 +3400,9 @@ export class LosslessAPI {
                             });
                             await this.assertUsableMedia(blob);
                             postProcessingQuality = source.quality || candidateQuality;
+                            options.onQuality?.(
+                                normalizeQualityToken(source.delivered || source.quality) || candidateQuality
+                            );
                             break;
                         } catch (sourceError) {
                             if (sourceError?.name === 'AbortError') throw sourceError;
@@ -3351,10 +3423,12 @@ export class LosslessAPI {
             if (!blob) {
                 throw lastDownloadError || new Error('Could not resolve stream URL');
             }
+            lap('download');
 
             if (!isVideo) {
                 blob = await applyAudioPostProcessing(blob, quality, onProgress, options.signal, postProcessingQuality);
             }
+            lap('convert');
 
             // Add metadata if track information is provided
             if (enrichedTrack) {
@@ -3385,6 +3459,11 @@ export class LosslessAPI {
                     console.error(err);
                 }
             }
+            lap('tag');
+            const seconds = (ms) => (ms / 1000).toFixed(1);
+            console.log(
+                `[timing] ${id} total ${seconds(performance.now() - timing.start)}s: lookup ${seconds(timing.enrich)}s, fetch ${seconds(timing.download)}s (${(blob.size / 1048576).toFixed(1)} MB), convert ${seconds(timing.convert)}s, tag ${seconds(timing.tag)}s`
+            );
 
             if (options.triggerDownload ?? true) {
                 // Detect actual format and fix filename extension if needed

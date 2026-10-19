@@ -57,6 +57,10 @@ export interface DownloadItem {
     progress: number;
     statusText?: string;
     bytes?: number;
+    /** Current fetch speed in bytes per second while downloading. */
+    speed?: number;
+    /** Quality the file was actually downloaded in, e.g. LOSSLESS (16-bit) when hi-res was asked for. */
+    quality?: string;
     /** Path of the saved file relative to the destination root. */
     path?: string;
     error?: string;
@@ -391,6 +395,13 @@ export function setDownloadHistoryEnabled(enabled: boolean) {
 }
 
 /** Jobs running or waiting in line. */
+/** True when a lossless job asked for more than 16-bit and this track was saved as 16-bit. */
+export function fellBackTo16Bit(job: DownloadJob, item: DownloadItem): boolean {
+    const asked = job.quality || '';
+    const wantedMore = asked === 'HI_RES_LOSSLESS' || asked.startsWith('DOLBY_ATMOS');
+    return wantedMore && item.status === 'done' && item.quality === 'LOSSLESS';
+}
+
 export function countActiveDownloads(list: readonly DownloadJob[] = jobs) {
     return list.filter((job) => isPending(job)).length;
 }

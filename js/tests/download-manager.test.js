@@ -91,4 +91,15 @@ describe('download-manager queue', () => {
         });
         expect(snapshot).toEqual({ id: 9, title: 'Song', artist: 'A, B', albumTitle: 'Record', cover: 'ab-cd' });
     });
+
+    test('flags tracks saved in 16-bit when hi-res was asked for', () => {
+        const hiRes = { quality: 'HI_RES_LOSSLESS' };
+        const done16 = { status: 'done', quality: 'LOSSLESS' };
+        expect(manager.fellBackTo16Bit(hiRes, done16)).toBe(true);
+        expect(manager.fellBackTo16Bit(hiRes, { status: 'done', quality: 'HI_RES_LOSSLESS' })).toBe(false);
+        expect(manager.fellBackTo16Bit(hiRes, { status: 'failed', quality: 'LOSSLESS' })).toBe(false);
+        // Asking for 16-bit and getting 16-bit is not a fallback.
+        expect(manager.fellBackTo16Bit({ quality: 'LOSSLESS' }, done16)).toBe(false);
+        expect(manager.fellBackTo16Bit({ quality: 'DOLBY_ATMOS_EAC3_HIGH' }, done16)).toBe(true);
+    });
 });
