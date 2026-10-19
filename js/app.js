@@ -22,6 +22,9 @@ import { Player } from './player.js';
 import { MultiScrobbler } from './multi-scrobbler.js';
 import { LyricsManager, openLyricsPanel, clearLyricsPanelSync } from './lyrics.js';
 import { createRouter, updateTabTitle, navigate } from './router.js';
+import { initDownloadsPage } from './downloads-page.js';
+import { registerAutomation } from './automation.js';
+import { isDesktopApp } from './desktop-bridge.ts';
 import { initializePlayerEvents, initializeTrackInteractions, handleTrackAction } from './events.js';
 import { initializeUIInteractions, updateLocalFilesSupportUI } from './ui-interactions.js';
 import { debounce, getShareUrl, normalizeQualityToken, sanitizeForFilename } from './utils.js';
@@ -2545,6 +2548,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     document.querySelector('.now-playing-bar .play-pause-btn').innerHTML = SVG_PLAY(20);
 
+    initDownloadsPage();
+    registerAutomation();
     const router = createRouter(UIRenderer.instance);
 
     // Navigations (search submit, suggestion clicks, links) can fire while the
@@ -2625,10 +2630,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     // PWA Update Logic
-    let isNativeApp = false;
+    // The desktop app updates by reinstalling, so it runs without the PWA service worker too.
+    let isNativeApp = isDesktopApp;
     try {
         const { Capacitor } = await import('@capacitor/core');
-        isNativeApp = Capacitor.isNativePlatform();
+        isNativeApp ||= Capacitor.isNativePlatform();
     } catch {}
 
     if (isNativeApp) {

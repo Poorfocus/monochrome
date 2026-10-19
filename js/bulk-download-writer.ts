@@ -1,4 +1,6 @@
 import { triggerDownload } from './download-utils';
+import { ensureFolderWritePermission, isFolderPermissionError } from './folder-permission';
+import { desktop } from './desktop-bridge';
 
 /**
  * A single entry to be included in a ZIP archive or written directly to a folder.
@@ -35,26 +37,35 @@ class SequentialFileWriter implements IBulkDownloadWriter {
 
     async write(files: AsyncIterable<WriterEntry>): Promise<void> {
         for await (const file of files) {
-            const name = file.name?.split('/').pop();
-            const ext = name?.split('.').pop().toLowerCase();
-
-            if (!name) {
-                console.warn('No name for file entry.', file);
-                continue;
-            }
-
-            if (['m3u', 'm3u8', 'cue', 'jpg', 'png', 'nfo', 'json'].includes(ext)) {
-                continue;
-            }
-
-            if (file.input instanceof Blob || file.input instanceof File) {
-                triggerDownload(file.input, name);
-            } else {
-                triggerDownload(new Blob([file.input as BlobPart]), name);
-            }
-            await new Promise((resolve) => setTimeout(resolve, 500));
+            await downloadWithBrowser(file);
         }
     }
+}
+
+/**
+ * Hands one entry to the browser's own downloads. Folder structure and
+ * sidecar files (playlists, covers, info) are dropped since they would land
+ * loose in the Downloads folder.
+ */
+async function downloadWithBrowser(file: WriterEntry): Promise<void> {
+    const name = file.name?.split('/').pop();
+    const ext = name?.split('.').pop().toLowerCase();
+
+    if (!name) {
+        console.warn('No name for file entry.', file);
+        return;
+    }
+
+    if (['m3u', 'm3u8', 'cue', 'jpg', 'png', 'nfo', 'json'].includes(ext)) {
+        return;
+    }
+
+    if (file.input instanceof Blob || file.input instanceof File) {
+        triggerDownload(file.input, name);
+    } else {
+        triggerDownload(new Blob([file.input as BlobPart]), name);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
 }
 
 const sequentialFileWriter = new SequentialFileWriter();
@@ -66,13 +77,34 @@ export { sequentialFileWriter as SequentialFileWriter };
  * Prompts the user to choose a save location with showSaveFilePicker.
  */
 export class ZipStreamWriter implements IBulkDownloadWriter {
+    private fileHandle: FileSystemFileHandle | null = null;
+
     constructor(private readonly suggestedFilename: string) {}
 
-    async write(files: AsyncIterable<WriterEntry>): Promise<void> {
-        const fileHandle = await window.showSaveFilePicker({
+    /**
+     * Shows the save dialog now. Call this from the click that started the
+     * download: a queued download may only write minutes later, when the
+     * browser no longer allows opening the dialog.
+     */
+    async pickFile(): Promise<FileSystemFileHandle> {
+        this.fileHandle ??= await window.showSaveFilePicker({
             suggestedName: this.suggestedFilename,
             types: [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }],
         });
+        return this.fileHandle;
+    }
+
+    /** The chosen archive, once {@link pickFile} has run. */
+    getFileHandle(): FileSystemFileHandle | null {
+        return this.fileHandle;
+    }
+
+    async write(files: AsyncIterable<WriterEntry>): Promise<void> {
+        const fileHandle = await this.pickFile();
+        // Access to the picked file can lapse while the job waits in the queue.
+        if (!(await ensureFolderWritePermission(fileHandle))) {
+            throw new DOMException(`No write access to ${fileHandle.name}`, 'NotAllowedError');
+        }
         const { downloadZip } = await loadClientZip();
         const writable = await fileHandle.createWritable();
         const response = downloadZip(files);
@@ -130,15 +162,8 @@ export class FolderPickerWriter implements IBulkDownloadWriter {
      */
     static async create(savedHandle?: FileSystemDirectoryHandle | null): Promise<FolderPickerWriter> {
         // Try to re-use a saved handle first
-        if (savedHandle) {
-            try {
-                const permission = await savedHandle.requestPermission({ mode: 'readwrite' });
-                if (permission === 'granted') {
-                    return new FolderPickerWriter(savedHandle);
-                }
-            } catch {
-                // Fall through to show the picker
-            }
+        if (savedHandle && (await ensureFolderWritePermission(savedHandle))) {
+            return new FolderPickerWriter(savedHandle);
         }
 
         // showDirectoryPicker is part of the File System Access API (not yet in all TS DOM libs)
@@ -156,38 +181,95 @@ export class FolderPickerWriter implements IBulkDownloadWriter {
     }
 
     async write(files: AsyncIterable<WriterEntry>): Promise<void> {
+        let folderUnavailable = false;
+
         for await (const file of files) {
             const parts = file.name.split('/').filter(Boolean);
             if (parts.length === 0) continue;
 
-            let currentDir: FileSystemDirectoryHandle = this.dirHandle;
-            for (let i = 0; i < parts.length - 1; i++) {
-                currentDir = await currentDir.getDirectoryHandle(parts[i], { create: true });
+            // Access can lapse while a long download runs in a background tab.
+            // Check before each file, and once more if the write itself is refused.
+            if (!folderUnavailable && !(await ensureFolderWritePermission(this.dirHandle))) {
+                folderUnavailable = true;
             }
 
-            const filename = parts[parts.length - 1];
-            const fileHandle = await currentDir.getFileHandle(filename, { create: true });
-            const writable = await fileHandle.createWritable();
-
-            try {
-                const { input } = file;
-                if (input instanceof Blob) {
-                    await writable.write(input);
-                } else if (typeof input === 'string') {
-                    await writable.write(new Blob([input], { type: 'text/plain' }));
-                } else {
-                    const buf =
-                        input instanceof Uint8Array
-                            ? input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength)
-                            : input;
-                    await writable.write(new Blob([buf as ArrayBuffer]));
+            if (!folderUnavailable) {
+                try {
+                    await this.writeEntry(parts, file.input);
+                    continue;
+                } catch (error) {
+                    if (!isFolderPermissionError(error)) throw error;
+                    console.warn('Folder write was refused, asking for access again:', error);
                 }
 
-                await writable.close();
-            } catch (error) {
-                await writable.abort();
-                throw error;
+                if (await ensureFolderWritePermission(this.dirHandle)) {
+                    await this.writeEntry(parts, file.input);
+                    continue;
+                }
+                folderUnavailable = true;
             }
+
+            // The user declined: keep the file instead of losing a finished download.
+            console.warn(`No write access to the download folder, saving "${file.name}" with the browser instead.`);
+            await downloadWithBrowser(file);
+        }
+    }
+
+    private async writeEntry(parts: string[], input: WriterEntry['input']): Promise<void> {
+        let currentDir: FileSystemDirectoryHandle = this.dirHandle;
+        for (let i = 0; i < parts.length - 1; i++) {
+            currentDir = await currentDir.getDirectoryHandle(parts[i], { create: true });
+        }
+
+        const filename = parts[parts.length - 1];
+        const fileHandle = await currentDir.getFileHandle(filename, { create: true });
+        const writable = await fileHandle.createWritable();
+
+        try {
+            if (input instanceof Blob) {
+                await writable.write(input);
+            } else if (typeof input === 'string') {
+                await writable.write(new Blob([input], { type: 'text/plain' }));
+            } else {
+                const buf =
+                    input instanceof Uint8Array
+                        ? input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength)
+                        : input;
+                await writable.write(new Blob([buf as ArrayBuffer]));
+            }
+
+            await writable.close();
+        } catch (error) {
+            await writable.abort().catch(() => {});
+            throw error;
+        }
+    }
+}
+
+/**
+ * Writes files into the desktop app's download folder through the desktop
+ * bridge: no pickers and no permission prompts. Subfolders in entry names
+ * are created as needed.
+ */
+export class DesktopFolderWriter implements IBulkDownloadWriter {
+    constructor(private readonly downloadDir: string) {}
+
+    /** Absolute path of the download folder, for display. */
+    getDownloadDir(): string {
+        return this.downloadDir;
+    }
+
+    async write(files: AsyncIterable<WriterEntry>): Promise<void> {
+        if (!desktop) throw new Error('The desktop bridge is not available');
+        for await (const file of files) {
+            const { input } = file;
+            let data: ArrayBuffer | Uint8Array | string;
+            if (typeof input === 'string' || input instanceof Uint8Array || input instanceof ArrayBuffer) {
+                data = input;
+            } else {
+                data = await input.arrayBuffer();
+            }
+            await desktop.writeFile(file.name, data);
         }
     }
 }

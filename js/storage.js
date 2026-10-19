@@ -2569,6 +2569,7 @@ export const sidebarSectionSettings = {
     SHOW_HOME_KEY: 'sidebar-show-home',
     SHOW_LIBRARY_KEY: 'sidebar-show-library',
     SHOW_RECENT_KEY: 'sidebar-show-recent',
+    SHOW_DOWNLOADS_KEY: 'sidebar-show-downloads',
     SHOW_UNRELEASED_KEY: 'sidebar-show-unreleased',
     SHOW_DONATE_KEY: 'sidebar-show-donate',
     SHOW_SETTINGS_KEY: 'sidebar-show-settings',
@@ -2581,6 +2582,7 @@ export const sidebarSectionSettings = {
         'sidebar-nav-home',
         'sidebar-nav-library',
         'sidebar-nav-recent',
+        'sidebar-nav-downloads',
         'sidebar-nav-unreleased',
         'sidebar-nav-donate',
         'sidebar-nav-settings',
@@ -2634,6 +2636,19 @@ export const sidebarSectionSettings = {
 
     setShowRecent(enabled) {
         localStorage.setItem(this.SHOW_RECENT_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowDownloads() {
+        try {
+            const val = localStorage.getItem(this.SHOW_DOWNLOADS_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowDownloads(enabled) {
+        localStorage.setItem(this.SHOW_DOWNLOADS_KEY, enabled ? 'true' : 'false');
     },
 
     shouldShowUnreleased() {
@@ -2745,6 +2760,11 @@ export const sidebarSectionSettings = {
                         order.splice(aboutIndex + 1, 0, 'sidebar-nav-mobile');
                     }
                 }
+                // Orders saved before the Downloads page existed: slot it in after Recent.
+                if (Array.isArray(order) && !order.includes('sidebar-nav-downloads')) {
+                    const recentIndex = order.indexOf('sidebar-nav-recent');
+                    order.splice(recentIndex === -1 ? order.length : recentIndex + 1, 0, 'sidebar-nav-downloads');
+                }
                 return this.normalizeOrder(order);
             }
         } catch {
@@ -2787,6 +2807,7 @@ export const sidebarSectionSettings = {
             { id: 'sidebar-nav-home', check: this.shouldShowHome() },
             { id: 'sidebar-nav-library', check: this.shouldShowLibrary() },
             { id: 'sidebar-nav-recent', check: this.shouldShowRecent() },
+            { id: 'sidebar-nav-downloads', check: this.shouldShowDownloads() },
             { id: 'sidebar-nav-unreleased', check: this.shouldShowUnreleased() },
             { id: 'sidebar-nav-donate', check: this.shouldShowDonate() },
             { id: 'sidebar-nav-settings', check: this.shouldShowSettings() },

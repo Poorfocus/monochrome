@@ -30,3 +30,8 @@ export async function downloadPlaylist(...args) {
     const { downloadPlaylist: download } = await loadDownloads();
     return download(...args);
 }
+
+export async function retryDownloadJob(...args) {
+    const { retryDownloadJob: retry } = await loadDownloads();
+    return retry(...args);
+}

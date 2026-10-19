@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { getProxyUrl, isTidalAudioUrl, wrapTidalUrl } from '../proxy-utils.js';
+import { downloadFetchEndpoints, getProxyUrl, isTidalAudioUrl, wrapTidalUrl } from '../proxy-utils.js';
 
 describe('proxy-utils', () => {
     test('returns original TIDAL audio segment URLs directly without audio proxying', () => {
@@ -27,5 +27,11 @@ describe('proxy-utils', () => {
         expect(wrapTidalUrl('https://tidal.com/browse/mix/1')).toBe(
             'https://tidal-proxy.monochrome.tf/tidal/browse/mix/1'
         );
+    });
+
+    test('downloads straight from the source URL without third-party proxies', () => {
+        const url = 'https://cdn.example.com/audio/1.flac';
+        expect(downloadFetchEndpoints(url)).toEqual([url]);
+        expect(downloadFetchEndpoints('blob:http://localhost/1')).toEqual(['blob:http://localhost/1']);
     });
 });

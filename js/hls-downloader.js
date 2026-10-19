@@ -1,5 +1,5 @@
 import { SegmentedDownloadProgress } from './progressEvents';
-import { getProxyUrl } from './proxy-utils';
+import { fetchDownload, getProxyUrl } from './proxy-utils';
 
 export class HlsDownloader {
     constructor() {}
@@ -7,12 +7,12 @@ export class HlsDownloader {
     async downloadHlsStream(masterUrl, options = {}) {
         const { onProgress, signal } = options;
 
-        const response = await fetch(getProxyUrl(masterUrl), { signal });
+        const response = await fetchDownload(getProxyUrl(masterUrl), { signal, attempts: 3 });
         const masterText = await response.text();
 
         const variantUrl = this.getBestVariantUrl(masterUrl, masterText);
 
-        const mediaResponse = await fetch(getProxyUrl(variantUrl), { signal });
+        const mediaResponse = await fetchDownload(getProxyUrl(variantUrl), { signal, attempts: 3 });
         const mediaText = await mediaResponse.text();
 
         const segments = this.parseMediaPlaylist(variantUrl, mediaText);
@@ -30,10 +30,12 @@ export class HlsDownloader {
             onProgress?.(new SegmentedDownloadProgress(downloadedBytes, undefined, i, totalSegments));
 
             const segmentUrl = segments[i];
-            const segmentResponse = await fetch(getProxyUrl(segmentUrl), { signal });
-
-            if (!segmentResponse.ok) {
-                throw new Error(`Failed to fetch segment ${i}: ${segmentResponse.status}`);
+            let segmentResponse;
+            try {
+                segmentResponse = await fetchDownload(getProxyUrl(segmentUrl), { signal, attempts: 3 });
+            } catch (error) {
+                if (error?.name === 'AbortError' || error?.message === 'AbortError') throw error;
+                throw new Error(`Failed to fetch segment ${i}: ${error?.message || error}`);
             }
 
             const chunk = await segmentResponse.arrayBuffer();

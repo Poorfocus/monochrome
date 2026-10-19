@@ -1,6 +1,7 @@
 {
     "name": "monochrome",
     "type": "module",
+    "main": "desktop/main.cjs",
     "version": "2.5.1",
     "description": "[<img src=\"https://github.com/monochrome-music/monochrome/blob/main/assets/512.png?raw=true\" alt=\"Monochrome Logo\">](https://monochrome.tf)",
     "scripts": {
@@ -15,6 +16,9 @@
         "deploy:pages": "bunx wrangler pages deploy dist",
         "postbuild": "node -e \"const fs = require('fs'); const path = require('path'); const src = 'extensions'; const dest = path.join('dist', 'Monochrome', 'extensions'); if (fs.existsSync(src)) { fs.mkdirSync(dest, { recursive: true }); fs.cpSync(src, dest, { recursive: true }); console.log('Extensions manually copied to ' + dest); }\"",
         "preview": "vite preview",
+        "desktop": "vite build && electron .",
+        "desktop:dist": "vite build && electron-builder --config desktop/electron-builder.json",
+        "mcp": "node mcp/server.mjs",
         "lint:js": "eslint .",
         "lint:css": "stylelint \"**/*.css\"",
         "lint:html": "htmlhint \"**/*.html\" --ignore=\"dist/**,legacy/**,node_modules/**\"",
@@ -38,8 +42,11 @@
     "homepage": "https://github.com/monochrome-music/monochrome#readme",
     "devDependencies": {
         "@lhci/cli": "^0.14.0",
+        "@modelcontextprotocol/sdk": "^1.32.1",
         "@types/node": "^25.3.5",
         "@vitest/browser-playwright": "^4.1.2",
+        "electron": "^38.8.6",
+        "electron-builder": "^26.15.3",
         "eslint": "^9.39.3",
         "eslint-config-prettier": "^10.1.8",
         "formidable": "^3.5.4",
@@ -52,7 +59,8 @@
         "typescript": "^5.9.3",
         "vite": "^7.3.1",
         "vite-bundle-visualizer": "^1.2.1",
-        "vite-plugin-pwa": "^1.2.0"
+        "vite-plugin-pwa": "^1.2.0",
+        "zod": "^4.6.7"
     },
     "overrides": {
         "sourcemap-codec": "^1.4.14",

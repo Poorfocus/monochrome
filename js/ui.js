@@ -1,5 +1,6 @@
 //js/ui.js
 import { showNotification } from './downloads.js';
+import { renderDownloadsPage } from './downloads-page.js';
 import {
     formatTime,
     createPlaceholder,
@@ -2623,6 +2624,10 @@ export class UIRenderer {
                 }
             }
         }
+        if (pageId === 'downloads') {
+            renderDownloadsPage();
+        }
+
         if (pageId === 'settings') {
             this.renderApiSettings();
             const savedTabName = settingsUiState.getActiveTab();

@@ -1,0 +1,29 @@
+{
+    "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+    "appId": "tf.monochrome.desktop",
+    "productName": "Monochrome",
+    "directories": {
+        "output": "release"
+    },
+    "files": ["dist/**/*", "desktop/main.cjs", "desktop/preload.cjs", "package.json", "!node_modules/**/*"],
+    "icon": "public/assets/appicon.png",
+    "win": {
+        "target": ["nsis", "portable"]
+    },
+    "nsis": {
+        "oneClick": false,
+        "perMachine": false,
+        "allowToChangeInstallationDirectory": true
+    },
+    "portable": {
+        "artifactName": "${productName}-${version}-portable.exe"
+    },
+    "mac": {
+        "target": ["dmg"],
+        "category": "public.app-category.music"
+    },
+    "linux": {
+        "target": ["AppImage", "deb"],
+        "category": "Audio"
+    }
+}

@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+        "monochrome": {
+            "command": "node",
+            "args": ["mcp/server.mjs"]
+        }
+    }
+}

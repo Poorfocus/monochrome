@@ -204,7 +204,10 @@ export enum BulkDownloadMethod {
 }
 
 export const modernSettings = new ModernSettings()
-    .addProperty('bulkDownloadFolder', null as FileSystemDirectoryHandle | null)
+    // Stored under the key downloads.js used before this setting existed.
+    .addProperty('bulkDownloadFolder', null as FileSystemDirectoryHandle | null, {
+        backingKey: 'bulk_download_folder_handle',
+    })
     .addProperty('forceZipBlob', false, {
         legacy: {
             key: 'bulk-download-force-zip-blob',
@@ -262,6 +265,8 @@ export const modernSettings = new ModernSettings()
         },
     })
     .addProperty('writeArtistsSeparately', false)
+    .addProperty('keepDownloadHistory', true)
+    .addProperty('showDownloadPopups', true)
     .finalize() as ModernSettings & {
     /** The last used directory handle for bulk downloads */
     bulkDownloadFolder: FileSystemDirectoryHandle | null;
@@ -290,4 +295,10 @@ export const modernSettings = new ModernSettings()
 
     /** Whether to write multiple artists to downloaded files */
     writeArtistsSeparately: boolean;
+
+    /** Whether finished downloads stay listed on the Downloads page after a reload */
+    keepDownloadHistory: boolean;
+
+    /** Whether download progress pop-ups show in the corner (prompts always show) */
+    showDownloadPopups: boolean;
 };

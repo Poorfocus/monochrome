@@ -50,7 +50,7 @@ export default defineConfig(
         },
     },
     {
-        files: ['**/*.js'],
+        files: ['**/*.js', '**/*.cjs', '**/*.mjs'],
         rules: {
             '@typescript-eslint/no-unsafe-assignment': 'off',
             '@typescript-eslint/no-unsafe-call': 'off',
@@ -59,5 +59,11 @@ export default defineConfig(
             '@typescript-eslint/no-unsafe-return': 'off',
             '@typescript-eslint/prefer-promise-reject-errors': 'off',
         },
+    },
+    {
+        // Electron main/preload scripts (desktop/) are CommonJS.
+        files: ['**/*.cjs'],
+        languageOptions: { sourceType: 'commonjs' },
+        rules: { '@typescript-eslint/no-require-imports': 'off' },
     }
 );

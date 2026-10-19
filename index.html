@@ -1763,6 +1763,12 @@
                                     <span>Recent</span>
                                 </a>
                             </li>
+                            <li class="nav-item" id="sidebar-nav-downloads">
+                                <a href="/downloads">
+                                    <use svg="!lucide/download.svg" size="24" />
+                                    <span>Downloads</span>
+                                </a>
+                            </li>
                             <li class="nav-item" id="sidebar-nav-unreleased">
                                 <a href="/unreleased">
                                     <use svg="./images/squares.svg" size="24" />
@@ -2399,6 +2405,7 @@
                     </section>
                 </div>
 
+                <div id="page-downloads" class="page"></div>
                 <div id="page-recent" class="page">
                     <div
                         style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem"
@@ -3621,6 +3628,18 @@
                                         </div>
                                         <label class="toggle-switch">
                                             <input type="checkbox" id="sidebar-show-recent-toggle" checked />
+                                            <span class="slider"></span>
+                                        </label>
+                                    </div>
+                                    <div class="setting-item">
+                                        <div class="info">
+                                            <span class="label">Show Downloads in Sidebar</span>
+                                            <span class="description"
+                                                >Display the Downloads link in the sidebar navigation</span
+                                            >
+                                        </div>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="sidebar-show-downloads-toggle" checked />
                                             <span class="slider"></span>
                                         </label>
                                     </div>
@@ -5554,6 +5573,56 @@
                                     <select id="lossless-container-setting">
                                         <option value="nochange">Don't change</option>
                                     </select>
+                                </div>
+                            </div>
+                            <div class="settings-group" id="download-manager-settings">
+                                <div class="setting-item" id="default-download-location-setting">
+                                    <div class="info">
+                                        <span class="label">Default Download Location</span>
+                                        <span class="description" id="default-download-location-description"
+                                            >Choose a folder and every album and track is saved there automatically,
+                                            organized as Album - Artist folders</span
+                                        >
+                                    </div>
+                                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap">
+                                        <button id="choose-download-location-btn" class="btn-secondary">Choose…</button>
+                                        <button id="clear-download-location-btn" class="btn-secondary">Clear</button>
+                                    </div>
+                                </div>
+                                <div class="setting-item">
+                                    <div class="info">
+                                        <span class="label">Download Pop-ups</span>
+                                        <span class="description"
+                                            >Show download progress in the corner. Everything is always listed on the
+                                            <a href="/downloads">Downloads page</a></span
+                                        >
+                                    </div>
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="show-download-popups-toggle" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <div class="setting-item">
+                                    <div class="info">
+                                        <span class="label">Keep Download History</span>
+                                        <span class="description"
+                                            >Keep finished downloads listed after closing the app, so you can find or
+                                            retry them later</span
+                                        >
+                                    </div>
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="keep-download-history-toggle" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <div class="setting-item">
+                                    <div class="info">
+                                        <span class="label">Clear Download History</span>
+                                        <span class="description"
+                                            >Remove finished downloads from the list. Files are not deleted</span
+                                        >
+                                    </div>
+                                    <button id="clear-download-history-btn" class="btn-secondary">Clear</button>
                                 </div>
                             </div>
                             <div class="settings-group">
