@@ -60,6 +60,7 @@ import { syncManager } from './accounts/pocketbase.js';
 import { containerFormats, customFormats } from './ffmpegFormats.ts';
 import { BulkDownloadMethod, modernSettings } from './ModernSettings.js';
 import { clearFinishedDownloads, setDownloadHistoryEnabled } from './download-manager.ts';
+import { desktop, isDesktopApp } from './desktop-bridge.ts';
 import { canBrowserStreamAtmosQuality } from './platform-detection.js';
 
 async function getButterchurnPresets(...args) {
@@ -1249,60 +1250,95 @@ export async function initializeSettings(scrobbler, player, api, ui) {
     const chooseLocationBtn = document.getElementById('choose-download-location-btn');
     const clearLocationBtn = document.getElementById('clear-download-location-btn');
 
-    function updateDownloadLocationUI() {
-        if (!locationDescription) return;
-        if (!hasFolderPicker) {
-            locationDescription.textContent =
-                "This browser can't save to a chosen folder (Chrome and Edge can), so downloads go to your browser's Downloads folder.";
-            chooseLocationBtn?.remove();
-            clearLocationBtn?.remove();
-            return;
+    if (isDesktopApp) {
+        // The desktop app writes straight to its own folder; the browser save methods don't apply.
+        for (const id of [
+            'bulk-download-method',
+            'remember-folder-setting',
+            'reset-saved-folder-setting',
+            'single-to-folder-setting',
+            'force-zip-blob-toggle',
+        ]) {
+            const node = document.getElementById(id);
+            const item = node?.classList.contains('setting-item') ? node : node?.closest('.setting-item');
+            if (item) item.style.display = 'none';
         }
-        const folder =
-            modernSettings.bulkDownloadMethod === BulkDownloadMethod.Folder && modernSettings.rememberBulkDownloadFolder
-                ? modernSettings.bulkDownloadFolder
-                : null;
-        locationDescription.textContent = folder
-            ? `Saving to "${folder.name}" automatically, organized as Album - Artist folders`
-            : 'Not set: you are asked where to save each download. Choose a folder to save everything there automatically';
-        if (clearLocationBtn) clearLocationBtn.style.display = folder ? '' : 'none';
+        if (clearLocationBtn) clearLocationBtn.textContent = 'Reset';
+
+        const showDesktopLocation = (dir) => {
+            if (locationDescription) {
+                locationDescription.textContent = `Every album and track is saved to ${dir}, organized as Album - Artist folders`;
+            }
+        };
+        showDesktopLocation(await desktop.getDownloadDir());
+        chooseLocationBtn?.addEventListener('click', async () => {
+            const dir = await desktop.chooseDownloadDir();
+            if (dir) showDesktopLocation(dir);
+        });
+        clearLocationBtn?.addEventListener('click', async () => showDesktopLocation(await desktop.resetDownloadDir()));
+    } else {
+        function updateDownloadLocationUI() {
+            if (!locationDescription) return;
+            if (!hasFolderPicker) {
+                locationDescription.textContent =
+                    "This browser can't save to a chosen folder (Chrome and Edge can), so downloads go to your browser's Downloads folder.";
+                chooseLocationBtn?.remove();
+                clearLocationBtn?.remove();
+                return;
+            }
+            const folder =
+                modernSettings.bulkDownloadMethod === BulkDownloadMethod.Folder &&
+                modernSettings.rememberBulkDownloadFolder
+                    ? modernSettings.bulkDownloadFolder
+                    : null;
+            locationDescription.textContent = folder
+                ? `Saving to "${folder.name}" automatically, organized as Album - Artist folders`
+                : 'Not set: you are asked where to save each download. Choose a folder to save everything there automatically';
+            if (clearLocationBtn) clearLocationBtn.style.display = folder ? '' : 'none';
+        }
+
+        chooseLocationBtn?.addEventListener('click', async () => {
+            let handle;
+            try {
+                handle = await window.showDirectoryPicker({ id: 'monochrome-downloads', mode: 'readwrite' });
+            } catch {
+                return; // cancelled
+            }
+            // A default location means: albums and single tracks both go straight there.
+            modernSettings.bulkDownloadFolder = handle;
+            modernSettings.rememberBulkDownloadFolder = true;
+            modernSettings.bulkDownloadMethod = BulkDownloadMethod.Folder;
+            modernSettings.downloadSinglesToFolder = true;
+            await modernSettings.waitPending();
+
+            if (bulkDownloadMethod) bulkDownloadMethod.value = BulkDownloadMethod.Folder;
+            if (rememberFolderToggle) rememberFolderToggle.checked = true;
+            if (singleToFolderToggle) singleToFolderToggle.checked = true;
+            updateForceZipBlobVisibility();
+            await updateFolderMethodVisibility();
+            updateDownloadLocationUI();
+        });
+
+        clearLocationBtn?.addEventListener('click', async () => {
+            modernSettings.bulkDownloadFolder = null;
+            await modernSettings.waitPending();
+            await updateFolderMethodVisibility();
+            updateDownloadLocationUI();
+        });
+
+        // Keep the location summary in sync with the method/remember controls below it.
+        bulkDownloadMethod?.addEventListener('change', () =>
+            modernSettings.waitPending().then(updateDownloadLocationUI)
+        );
+        rememberFolderToggle?.addEventListener('change', () =>
+            modernSettings.waitPending().then(updateDownloadLocationUI)
+        );
+        resetSavedFolderBtn?.addEventListener('click', () =>
+            modernSettings.waitPending().then(updateDownloadLocationUI)
+        );
+        await modernSettings.waitPending();
+        updateDownloadLocationUI();
     }
-
-    chooseLocationBtn?.addEventListener('click', async () => {
-        let handle;
-        try {
-            handle = await window.showDirectoryPicker({ id: 'monochrome-downloads', mode: 'readwrite' });
-        } catch {
-            return; // cancelled
-        }
-        // A default location means: albums and single tracks both go straight there.
-        modernSettings.bulkDownloadFolder = handle;
-        modernSettings.rememberBulkDownloadFolder = true;
-        modernSettings.bulkDownloadMethod = BulkDownloadMethod.Folder;
-        modernSettings.downloadSinglesToFolder = true;
-        await modernSettings.waitPending();
-
-        if (bulkDownloadMethod) bulkDownloadMethod.value = BulkDownloadMethod.Folder;
-        if (rememberFolderToggle) rememberFolderToggle.checked = true;
-        if (singleToFolderToggle) singleToFolderToggle.checked = true;
-        updateForceZipBlobVisibility();
-        await updateFolderMethodVisibility();
-        updateDownloadLocationUI();
-    });
-
-    clearLocationBtn?.addEventListener('click', async () => {
-        modernSettings.bulkDownloadFolder = null;
-        await modernSettings.waitPending();
-        await updateFolderMethodVisibility();
-        updateDownloadLocationUI();
-    });
-
-    // Keep the location summary in sync with the method/remember controls below it.
-    bulkDownloadMethod?.addEventListener('change', () => modernSettings.waitPending().then(updateDownloadLocationUI));
-    rememberFolderToggle?.addEventListener('change', () => modernSettings.waitPending().then(updateDownloadLocationUI));
-    resetSavedFolderBtn?.addEventListener('click', () => modernSettings.waitPending().then(updateDownloadLocationUI));
-    await modernSettings.waitPending();
-    updateDownloadLocationUI();
 
     const showDownloadPopupsToggle = document.getElementById('show-download-popups-toggle');
     if (showDownloadPopupsToggle) {

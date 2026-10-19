@@ -206,6 +206,22 @@ npm run build
 
 ---
 
+## Desktop App
+
+A desktop build (Electron) runs the same app in its own window and saves downloads straight into a folder you choose in **Settings → Downloads**, with no save dialogs, as `Album - Artist/` folders with cover art.
+
+```bash
+bun install
+bun run desktop        # build the web app and open it in the desktop window
+bun run desktop:dist   # package an installer into release/
+```
+
+Downloads run one at a time in a queue, and the **Downloads** page shows every album and track with its saved location, a **Show in folder** button and **Retry**. Tracks that fail are retried automatically until they download (cancel or remove the job to stop).
+
+### MCP server
+
+`mcp/` is an MCP server that lets Claude find and download a whole list of albums through the desktop app. See [mcp/README.md](mcp/README.md).
+
 ## Usage
 
 ### Basic Usage

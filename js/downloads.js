@@ -14,7 +14,14 @@ import {
 } from './utils.js';
 import { downloadQualitySettings, lyricsSettings, playlistSettings } from './storage.js';
 import { generateM3U, generateM3U8, generateCUE, generateNFO, generateJSON } from './playlist-generator.js';
-import { ZipStreamWriter, ZipBlobWriter, FolderPickerWriter, SequentialFileWriter } from './bulk-download-writer.ts';
+import {
+    DesktopFolderWriter,
+    FolderPickerWriter,
+    SequentialFileWriter,
+    ZipBlobWriter,
+    ZipStreamWriter,
+} from './bulk-download-writer.ts';
+import { desktop, isDesktopApp } from './desktop-bridge.ts';
 import { ensureFolderWritePermission, setFolderAccessPrompt } from './folder-permission.ts';
 import { FfmpegProgress } from './ffmpeg.types.js';
 import { DownloadProgress, ProgressMessage, SegmentedDownloadProgress } from './progressEvents.js';
@@ -31,6 +38,7 @@ import {
     isDownloadQueueBusy,
     removeDownloadJob,
     setDownloadDestination,
+    setJobAutoRetry,
     startDownloadJob,
     updateDownloadItem,
 } from './download-manager.ts';
@@ -42,10 +50,118 @@ const ongoingDownloads = new Set();
 const retryHandlers = new Map();
 let downloadNotificationContainer = null;
 
-/** Wait before giving tracks that failed in an album one more try. */
-const RETRY_FAILED_TRACKS_DELAY_MS = 3000;
+/**
+ * Failed tracks are never abandoned. While an album runs they are retried in
+ * rounds with a growing pause (3s, 6s, 12s, 24s). If some still fail, the
+ * album finishes with what it has so the queue keeps moving, and the app
+ * queues it again for the missing tracks after a longer pause (1, 2, 4, 8,
+ * then every 10 minutes), until every track is saved or the job is cancelled
+ * or removed.
+ */
+const retryTiming = {
+    inlineRounds: 4,
+    inlineBaseMs: 3000,
+    autoBaseMs: 60 * 1000,
+    autoMaxMs: 10 * 60 * 1000,
+};
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Overrides the retry pauses and round count; for tests. */
+export function setRetryTiming(overrides) {
+    Object.assign(retryTiming, overrides);
+}
+
+/** Pause between automatic re-queues of a job with missing tracks. */
+export function autoRetryDelayMs(attempt) {
+    return Math.min(retryTiming.autoBaseMs * 2 ** attempt, retryTiming.autoMaxMs);
+}
+
+/** Waits `ms`, calling `onTick(remainingMs)` each second; rejects with AbortError if `signal` aborts. */
+function abortableDelay(ms, signal, onTick = null) {
+    return new Promise((resolve, reject) => {
+        const abortError = () => new DOMException('The operation was aborted.', 'AbortError');
+        if (signal?.aborted) return reject(abortError());
+        const end = Date.now() + ms;
+        let timer;
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(abortError());
+        };
+        const step = () => {
+            const remaining = end - Date.now();
+            if (remaining <= 0) {
+                signal?.removeEventListener('abort', onAbort);
+                return resolve();
+            }
+            onTick?.(remaining);
+            timer = setTimeout(step, Math.min(1000, remaining));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        step();
+    });
+}
+
+/**
+ * Retries `indices` (tracks that failed) round after round, calling
+ * `runTrack(index)` (a generator that yields the track's files and returns
+ * true when it saved). Stops after `rounds` rounds, or never when `rounds` is
+ * Infinity, and returns the indices still failing.
+ */
+async function* retryFailedTracks(
+    indices,
+    runTrack,
+    { signal, jobId, itemOffset = 0, rounds = retryTiming.inlineRounds }
+) {
+    let pending = [...indices];
+    for (let round = 1; pending.length > 0 && round <= rounds; round++) {
+        const waitMs = retryTiming.inlineBaseMs * 2 ** (round - 1);
+        const errors = new Map(
+            pending.map((i) => [i, getDownloadJobs().find((j) => j.id === jobId)?.items[itemOffset + i]?.error])
+        );
+        await abortableDelay(waitMs, signal, (remaining) => {
+            for (const i of pending) {
+                updateDownloadItem(jobId, itemOffset + i, {
+                    status: 'queued',
+                    progress: 0,
+                    statusText: `Retry ${round}/${rounds} in ${Math.ceil(remaining / 1000)}s${errors.get(i) ? ` · ${errors.get(i)}` : ''}`,
+                });
+            }
+        });
+        const still = [];
+        for (const i of pending) {
+            if (signal.aborted) return pending;
+            if (!(yield* runTrack(i, true))) still.push(i);
+        }
+        pending = still;
+    }
+    return pending;
+}
+
+/** Queues a finished job's missing tracks again after a pause that grows with `attempt`. */
+function scheduleAutoRetry(jobId, attempt) {
+    const job = getDownloadJobs().find((j) => j.id === jobId);
+    if (!job) return;
+    const at = Date.now() + autoRetryDelayMs(attempt);
+    setJobAutoRetry(jobId, at);
+    console.log(`Will retry the missing tracks of "${job.title}" in ${Math.round((at - Date.now()) / 1000)}s`);
+    setTimeout(() => {
+        const current = getDownloadJobs().find((j) => j.id === jobId);
+        // Removed, retried by hand, or cancelled in the meantime: nothing left to do.
+        if (!current || current.autoRetryAt !== at) return;
+        retryDownloadJob(jobId, undefined, { auto: true }).catch((error) => {
+            console.error('Automatic retry failed:', error);
+            scheduleAutoRetry(jobId, attempt + 1);
+        });
+    }, at - Date.now());
+}
+
+/** Finishes a job and, if tracks are still missing, queues it again after a pause. */
+function settleJob(jobId, outcome = {}) {
+    finishDownloadJob(jobId, outcome);
+    const job = getDownloadJobs().find((j) => j.id === jobId);
+    if (!job || job.status === 'cancelled' || job.status === 'done') return;
+    if (!job.items.some((item) => item.status === 'failed')) return;
+    scheduleAutoRetry(jobId, job.attempt || 0);
+}
 
 /** Fraction of the current file received, or null for progress events without one. */
 function progressFraction(progress) {
@@ -60,6 +176,9 @@ function progressFraction(progress) {
 
 /** Where a writer puts files, for the Downloads page. */
 function describeDestination(writer, folderName = '') {
+    if (writer instanceof DesktopFolderWriter) {
+        return { method: 'desktop', label: writer.getDownloadDir() };
+    }
     if (writer instanceof FolderPickerWriter) {
         const handle = writer.getDirHandle();
         const method = modernSettings.bulkDownloadMethod === BulkDownloadMethod.LocalMedia ? 'local' : 'folder';
@@ -527,7 +646,12 @@ async function* downloadTrackFiles({
     jobId,
     onProgress = null,
 }) {
-    updateDownloadItem(jobId, itemIndex, { status: 'downloading', progress: 0, error: undefined });
+    updateDownloadItem(jobId, itemIndex, {
+        status: 'downloading',
+        progress: 0,
+        error: undefined,
+        statusText: undefined,
+    });
 
     const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, (p) => {
         const fraction = progressFraction(p);
@@ -644,7 +768,12 @@ async function bulkDownload({
                 if (err?.name === 'AbortError' || signal.aborted) throw err;
                 if (!stats.firstError) stats.firstError = err?.message || String(err);
                 console.error(`Failed to download track ${trackTitle}:`, err);
-                updateDownloadItem(jobId, i, { status: 'failed', progress: 0, error: err?.message || String(err) });
+                updateDownloadItem(jobId, i, {
+                    status: 'failed',
+                    progress: 0,
+                    error: err?.message || String(err),
+                    statusText: undefined,
+                });
                 return false;
             }
         }
@@ -662,14 +791,10 @@ async function bulkDownload({
             }
         }
 
-        // Every source was already tried for these; one more pass after a pause
-        // catches failures from rate limits or a briefly unavailable instance.
+        // Every source was already tried for these; retry them in rounds with growing pauses.
+        // Whatever still fails is retried by a later run of this job (see settleJob).
         if (failedIndices.length > 0 && !signal.aborted) {
-            await delay(RETRY_FAILED_TRACKS_DELAY_MS);
-            for (const i of failedIndices) {
-                if (signal.aborted) break;
-                yield* runTrack(i, true);
-            }
+            yield* retryFailedTracks(failedIndices, runTrack, { signal, jobId });
         }
         stats.failed = trackPaths.filter((path) => path === null).length;
 
@@ -772,6 +897,8 @@ async function getSavedDownloadFolder() {
  * back to a normal browser download.
  */
 async function createSingleTrackFolderWriter() {
+    // The desktop app always saves straight to its download folder.
+    if (isDesktopApp) return new DesktopFolderWriter(await desktop.getDownloadDir());
     if (!modernSettings.downloadSinglesToFolder) return null;
 
     const method = modernSettings.bulkDownloadMethod;
@@ -820,6 +947,8 @@ async function createSingleTrackFolderWriter() {
  * not when the job reaches the front of the queue.
  */
 async function createBulkWriter(folderName, displayName = folderName) {
+    if (isDesktopApp) return new DesktopFolderWriter(await desktop.getDownloadDir());
+
     const method = modernSettings.bulkDownloadMethod;
     const forceZipBlob = modernSettings.forceZipBlob;
     const hasFileSystemAccess = 'showSaveFilePicker' in window && 'createWritable' in FileSystemFileHandle.prototype;
@@ -911,6 +1040,7 @@ async function startBulkDownload({
     single = false,
     prepare = null,
     alreadySaved = null,
+    attempt = 0,
     source = { kind: 'tracks' },
     retry = null,
 }) {
@@ -925,6 +1055,7 @@ async function startBulkDownload({
         folderName,
         tracks,
         source,
+        attempt,
         onCancel: () => abortController.abort(),
     });
     if (retry) retryHandlers.set(jobId, retry);
@@ -974,7 +1105,7 @@ async function startBulkDownload({
                 failedTracks: stats?.failed || 0,
                 totalTracks: stats?.total || 0,
             });
-            finishDownloadJob(jobId, { error: stats?.failed ? stats.firstError || undefined : undefined });
+            settleJob(jobId, { error: stats?.failed ? stats.firstError || undefined : undefined });
 
             // If the download went to the local media folder, refresh the local library.
             if (modernSettings.bulkDownloadMethod === BulkDownloadMethod.LocalMedia) {
@@ -988,12 +1119,18 @@ async function startBulkDownload({
             }
             console.error('Bulk download failed:', error);
             completeBulkDownload(notification, false, error?.message);
-            finishDownloadJob(jobId, { error: error?.message || String(error) });
+            settleJob(jobId, { error: error?.message || String(error) });
         }
     });
 }
 
-export async function downloadTracks(tracks, api, quality, _lyricsManager = null, { alreadySaved = null } = {}) {
+export async function downloadTracks(
+    tracks,
+    api,
+    quality,
+    _lyricsManager = null,
+    { alreadySaved = null, attempt = 0 } = {}
+) {
     const folderName = `Queue - ${new Date().toISOString().slice(0, 10)}`;
     await startBulkDownload({
         tracks,
@@ -1007,11 +1144,19 @@ export async function downloadTracks(tracks, api, quality, _lyricsManager = null
         },
         api,
         alreadySaved,
-        retry: (saved) => downloadTracks(tracks, api, quality, null, { alreadySaved: saved }),
+        attempt,
+        retry: (saved, next) => downloadTracks(tracks, api, quality, null, { alreadySaved: saved, attempt: next }),
     });
 }
 
-export async function downloadAlbum(album, tracks, api, quality, _lyricsManager = null, { alreadySaved = null } = {}) {
+export async function downloadAlbum(
+    album,
+    tracks,
+    api,
+    quality,
+    _lyricsManager = null,
+    { alreadySaved = null, attempt = 0 } = {}
+) {
     const releaseDateStr =
         album.releaseDate || (tracks[0]?.streamStartDate ? tracks[0].streamStartDate.split('T')[0] : '');
     const releaseDate = releaseDateStr ? new Date(releaseDateStr) : null;
@@ -1040,8 +1185,10 @@ export async function downloadAlbum(album, tracks, api, quality, _lyricsManager 
             coverBlob: await getCoverBlob(api, coverId),
         }),
         alreadySaved,
-        source: { kind: 'album', id: album.id },
-        retry: (saved) => downloadAlbum(album, tracks, api, quality, null, { alreadySaved: saved }),
+        attempt,
+        source: { kind: 'album', id: album.id, provider: album.provider },
+        retry: (saved, next) =>
+            downloadAlbum(album, tracks, api, quality, null, { alreadySaved: saved, attempt: next }),
     });
 }
 
@@ -1051,7 +1198,7 @@ export async function downloadPlaylist(
     api,
     quality,
     _lyricsManager = null,
-    { alreadySaved = null } = {}
+    { alreadySaved = null, attempt = 0 } = {}
 ) {
     const folderName = formatPathTemplate(modernSettings.folderTemplate, {
         albumTitle: playlist.title,
@@ -1072,7 +1219,9 @@ export async function downloadPlaylist(
         api,
         prepare: async () => ({ coverBlob: await getCoverBlob(api, representativeTrack?.album?.cover) }),
         alreadySaved,
-        retry: (saved) => downloadPlaylist(playlist, tracks, api, quality, null, { alreadySaved: saved }),
+        attempt,
+        retry: (saved, next) =>
+            downloadPlaylist(playlist, tracks, api, quality, null, { alreadySaved: saved, attempt: next }),
     });
 }
 
@@ -1082,7 +1231,7 @@ export async function downloadDiscography(
     api,
     quality,
     lyricsManager = null,
-    { alreadySaved = null } = {}
+    { alreadySaved = null, attempt = 0 } = {}
 ) {
     const rootFolder = `${sanitizeForFilename(artist.name)} discography`;
     const abortController = new AbortController();
@@ -1104,10 +1253,14 @@ export async function downloadDiscography(
             artist: { id: artist.id, name: artist.name },
             releases: selectedReleases.map((r) => ({ id: r.id, title: r.title, cover: r.cover || null })),
         },
+        attempt,
         onCancel: () => abortController.abort(),
     });
-    retryHandlers.set(jobId, (saved) =>
-        downloadDiscography(artist, selectedReleases, api, quality, lyricsManager, { alreadySaved: saved })
+    retryHandlers.set(jobId, (saved, next) =>
+        downloadDiscography(artist, selectedReleases, api, quality, lyricsManager, {
+            alreadySaved: saved,
+            attempt: next,
+        })
     );
 
     // Different versions of the same album (standard/deluxe) otherwise produce
@@ -1196,6 +1349,7 @@ export async function downloadDiscography(
                             status: 'failed',
                             progress: 0,
                             error: err?.message || String(err),
+                            statusText: undefined,
                         });
                         return false;
                     }
@@ -1214,11 +1368,7 @@ export async function downloadDiscography(
                     }
                 }
                 if (failedIndices.length > 0 && !signal.aborted) {
-                    await delay(RETRY_FAILED_TRACKS_DELAY_MS);
-                    for (const i of failedIndices) {
-                        if (signal.aborted) break;
-                        yield* runTrack(i);
-                    }
+                    yield* retryFailedTracks(failedIndices, runTrack, { signal, jobId, itemOffset: firstItem });
                 }
                 stats.failed += trackPaths.filter((path) => path === null).length;
 
@@ -1313,7 +1463,7 @@ export async function downloadDiscography(
                 failedTracks: stats.failed,
                 totalTracks: stats.total,
             });
-            finishDownloadJob(jobId, { error: stats.failed ? stats.firstError || undefined : undefined });
+            settleJob(jobId, { error: stats.failed ? stats.firstError || undefined : undefined });
         } catch (error) {
             if (error?.name === 'AbortError' || signal.aborted) {
                 removeBulkDownloadTask(notification);
@@ -1321,7 +1471,7 @@ export async function downloadDiscography(
                 return;
             }
             completeBulkDownload(notification, false, error?.message);
-            finishDownloadJob(jobId, { error: error?.message || String(error) });
+            settleJob(jobId, { error: error?.message || String(error) });
         }
     });
 }
@@ -1489,7 +1639,8 @@ export async function downloadTrackWithMetadata(
     quality,
     api = MusicAPI.instance,
     lyricsManager = null,
-    abortController = null
+    abortController = null,
+    { attempt = 0 } = {}
 ) {
     if (!track) {
         alert('No track is currently playing');
@@ -1518,13 +1669,16 @@ export async function downloadTrackWithMetadata(
         cover: track.album?.cover || null,
         quality,
         tracks: [track],
-        source: { kind: 'track', id: track.id },
+        source: { kind: 'track', id: track.id, provider: track.provider },
+        attempt,
         onCancel: () => {
             controller.abort();
             ongoingDownloads.delete(downloadKey);
         },
     });
-    retryHandlers.set(jobId, () => downloadTrackWithMetadata(track, quality, api, lyricsManager));
+    retryHandlers.set(jobId, (_saved, next) =>
+        downloadTrackWithMetadata(track, quality, api, lyricsManager, null, { attempt: next })
+    );
 
     // Resolve the folder writer first, while the click that started the download
     // still counts as user activation for the permission prompt.
@@ -1611,7 +1765,8 @@ async function runTrackDownload({
         updateDownloadItem(jobId, 0, { status: 'done', progress: 1, bytes: blob.size, path: entryName });
 
         // Album art next to the track, like album downloads do.
-        if (folderWriter instanceof FolderPickerWriter && subFolder && playlistSettings.shouldIncludeCover()) {
+        const savesToFolder = folderWriter instanceof FolderPickerWriter || folderWriter instanceof DesktopFolderWriter;
+        if (savesToFolder && subFolder && playlistSettings.shouldIncludeCover()) {
             try {
                 const coverBlob = await getCoverBlob(api, enrichedTrack.album?.cover);
                 if (coverBlob) {
@@ -1670,7 +1825,7 @@ async function runTrackDownload({
                 error.message === RATE_LIMIT_ERROR_MESSAGE ? error.message : 'Download failed. Please try again.';
             completeDownloadTask(track.id, false, errorMsg);
             updateDownloadItem(jobId, 0, { status: 'failed', progress: 0, error: error?.message || String(error) });
-            finishDownloadJob(jobId, { error: error?.message || String(error) });
+            settleJob(jobId, { error: error?.message || String(error) });
         } else {
             finishDownloadJob(jobId, { cancelled: true });
         }
@@ -1679,7 +1834,13 @@ async function runTrackDownload({
     }
 }
 
-export async function downloadLikedTracks(tracks, api, quality, _lyricsManager = null, { alreadySaved = null } = {}) {
+export async function downloadLikedTracks(
+    tracks,
+    api,
+    quality,
+    _lyricsManager = null,
+    { alreadySaved = null, attempt = 0 } = {}
+) {
     const folderName = `Liked Tracks - ${new Date().toISOString().slice(0, 10)}`;
     await startBulkDownload({
         tracks,
@@ -1690,7 +1851,8 @@ export async function downloadLikedTracks(tracks, api, quality, _lyricsManager =
         subtitle: `${tracks.length} track${tracks.length === 1 ? '' : 's'}`,
         api,
         alreadySaved,
-        retry: (saved) => downloadLikedTracks(tracks, api, quality, null, { alreadySaved: saved }),
+        attempt,
+        retry: (saved, next) => downloadLikedTracks(tracks, api, quality, null, { alreadySaved: saved, attempt: next }),
     });
 }
 
@@ -1698,8 +1860,10 @@ export async function downloadLikedTracks(tracks, api, quality, _lyricsManager =
  * Downloads again whatever a finished job did not save, into the same
  * folder. Tracks it already saved are skipped but kept in playlist files.
  * Works for jobs from earlier sessions too, by looking the tracks up again.
+ * The old job is only replaced once the new one is queued, so a failed
+ * lookup (offline, say) leaves it in place to be retried again.
  */
-export async function retryDownloadJob(jobId, api = MusicAPI.instance) {
+export async function retryDownloadJob(jobId, api = MusicAPI.instance, { auto = false } = {}) {
     const job = getDownloadJobs().find((j) => j.id === jobId);
     if (!job || job.status === 'active' || job.status === 'queued') return;
 
@@ -1711,36 +1875,51 @@ export async function retryDownloadJob(jobId, api = MusicAPI.instance) {
     const quality = job.quality || downloadQualitySettings.getQuality();
     const lyricsManager = LyricsManager.instance;
     const source = job.source || { kind: 'tracks' };
+    // Automatic retries count up so the pauses between them grow; a manual retry starts over.
+    const attempt = auto ? (job.attempt || 0) + 1 : 0;
+
+    // IDs from the monochrome catalog only resolve with their prefix once the in-memory catalog cache is gone.
+    const qualify = (id, type, provider) =>
+        provider === 'tracks' && !String(id).startsWith('tracks:') ? `tracks:${type}:${id}` : id;
+    const replaceJob = () => {
+        removeDownloadJob(jobId);
+        retryHandlers.delete(jobId);
+    };
 
     const retry = retryHandlers.get(jobId);
-    removeDownloadJob(jobId);
-    retryHandlers.delete(jobId);
-    if (retry) return retry(alreadySaved);
+    if (retry) {
+        replaceJob();
+        return retry(alreadySaved, attempt);
+    }
 
     if (source.kind === 'track') {
-        const track = await api.getTrackMetadata(source.id ?? job.items[0]?.track.id);
-        return downloadTrackWithMetadata(track, quality, api, lyricsManager);
+        const item = job.items[0];
+        const track = await api.getTrackMetadata(
+            qualify(source.id ?? item?.track.id, 'track', source.provider ?? item?.track.provider)
+        );
+        replaceJob();
+        return downloadTrackWithMetadata(track, quality, api, lyricsManager, null, { attempt });
     }
     if (source.kind === 'album' && source.id != null) {
-        const { album, tracks } = await api.getAlbum(source.id);
-        return downloadAlbum(album, tracks, api, quality, null, { alreadySaved });
+        const { album, tracks } = await api.getAlbum(qualify(source.id, 'album', source.provider));
+        replaceJob();
+        return downloadAlbum(album, tracks, api, quality, null, { alreadySaved, attempt });
     }
     if (source.kind === 'discography' && source.artist && source.releases?.length) {
-        return downloadDiscography(source.artist, source.releases, api, quality, lyricsManager, { alreadySaved });
+        replaceJob();
+        return downloadDiscography(source.artist, source.releases, api, quality, lyricsManager, {
+            alreadySaved,
+            attempt,
+        });
     }
 
     const tracks = [];
     for (const item of job.items) {
-        try {
-            tracks.push(await api.getTrackMetadata(item.track.id));
-        } catch (error) {
-            console.warn(`Could not look up "${item.track.title}" to retry it:`, error);
-        }
+        // A failed lookup throws: the job stays, and the caller retries later.
+        tracks.push(await api.getTrackMetadata(qualify(item.track.id, 'track', item.track.provider)));
     }
-    if (tracks.length === 0) {
-        showNotification(`Couldn't retry "${job.title}": its tracks could not be found`);
-        return;
-    }
+    if (tracks.length === 0) return;
+    replaceJob();
     await startBulkDownload({
         tracks,
         folderName: job.folderName || sanitizeForFilename(job.title),
@@ -1752,5 +1931,6 @@ export async function retryDownloadJob(jobId, api = MusicAPI.instance) {
         metadata: { title: job.title },
         api,
         alreadySaved,
+        attempt,
     });
 }

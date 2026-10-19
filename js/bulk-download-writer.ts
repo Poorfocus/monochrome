@@ -1,5 +1,6 @@
 import { triggerDownload } from './download-utils';
 import { ensureFolderWritePermission, isFolderPermissionError } from './folder-permission';
+import { desktop } from './desktop-bridge';
 
 /**
  * A single entry to be included in a ZIP archive or written directly to a folder.
@@ -241,6 +242,34 @@ export class FolderPickerWriter implements IBulkDownloadWriter {
         } catch (error) {
             await writable.abort().catch(() => {});
             throw error;
+        }
+    }
+}
+
+/**
+ * Writes files into the desktop app's download folder through the desktop
+ * bridge: no pickers and no permission prompts. Subfolders in entry names
+ * are created as needed.
+ */
+export class DesktopFolderWriter implements IBulkDownloadWriter {
+    constructor(private readonly downloadDir: string) {}
+
+    /** Absolute path of the download folder, for display. */
+    getDownloadDir(): string {
+        return this.downloadDir;
+    }
+
+    async write(files: AsyncIterable<WriterEntry>): Promise<void> {
+        if (!desktop) throw new Error('The desktop bridge is not available');
+        for await (const file of files) {
+            const { input } = file;
+            let data: ArrayBuffer | Uint8Array | string;
+            if (typeof input === 'string' || input instanceof Uint8Array || input instanceof ArrayBuffer) {
+                data = input;
+            } else {
+                data = await input.arrayBuffer();
+            }
+            await desktop.writeFile(file.name, data);
         }
     }
 }

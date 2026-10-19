@@ -11,6 +11,7 @@ import {
 } from './download-manager.ts';
 import { canShowInFolder, describeSavedPath, showInFolder } from './download-locations.ts';
 import { retryDownloadJob } from './download-service.js';
+import { isDesktopApp } from './desktop-bridge.ts';
 import { settingsUiState } from './storage.js';
 import {
     SVG_BIN,
@@ -39,6 +40,9 @@ const FILTERS = [
     { id: 'done', label: 'Completed' },
     { id: 'failed', label: 'Needs attention' },
 ];
+
+// The desktop app opens the real file explorer; a browser can only open the file dialog there.
+const SHOW_IN_FOLDER_HINT = isDesktopApp ? 'Show in folder' : 'Show in folder (opens your system file dialog there)';
 
 const KIND_LABELS = {
     track: 'Track',
@@ -152,12 +156,19 @@ function jobStatusText(job) {
         case 'done':
             return [total > 1 ? `${total} tracks` : 'Saved', size].filter(Boolean).join(' · ');
         case 'partial':
-            return `${done}/${total} saved · ${failed} failed`;
+            return `${done}/${total} saved · ${failed} failed${retryNote(job)}`;
         case 'cancelled':
             return done > 0 ? `Cancelled · ${done}/${total} saved` : 'Cancelled';
         default:
-            return job.error || 'Download failed';
+            return `${job.error || 'Download failed'}${retryNote(job)}`;
     }
+}
+
+/** " · retrying at 3:42 PM" while the app has an automatic retry scheduled for the job. */
+function retryNote(job) {
+    if (!job.autoRetryAt) return '';
+    const time = new Date(job.autoRetryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return ` · retrying automatically at ${time}`;
 }
 
 function destinationText(job) {
@@ -169,6 +180,8 @@ function destinationText(job) {
             return `Saving to ${destination.label}${job.folderName ? `/${job.folderName}` : ''}`;
         case 'zip':
             return `Saving to ${destination.label}`;
+        case 'desktop':
+            return `Saving to ${describeSavedPath(destination, job.folderName || '')}`;
         default:
             return destination.label && destination.label !== 'Browser downloads'
                 ? `Saving to your browser's Downloads folder as ${destination.label}`
@@ -177,6 +190,8 @@ function destinationText(job) {
 }
 
 function itemDetail(item) {
+    // Retry countdowns and the last error while a track waits for its next attempt.
+    if (item.statusText && (item.status === 'queued' || item.status === 'failed')) return item.statusText;
     switch (item.status) {
         case 'downloading':
             return `${Math.round(item.progress * 100)}%`;
@@ -240,7 +255,7 @@ function updateTrackRow(row, job, item, index, number) {
         refs.actions.replaceChildren();
         if (showFolder) {
             refs.actions.appendChild(
-                iconButton(SVG_FOLDER_OPEN(16), 'Show in folder (opens your system file dialog there)', () => {
+                iconButton(SVG_FOLDER_OPEN(16), SHOW_IN_FOLDER_HINT, () => {
                     const current = row.card.job;
                     showInFolder(current.destination, current.items[index]?.path).catch(reportError);
                 })
@@ -333,14 +348,15 @@ function updateActions(card, job) {
     const pending = isPending(job);
     const folder = canShowInFolder(job.destination) && summary.done > 0;
     const retry = !pending && (job.status !== 'done' || summary.failed > 0);
-    const key = `${pending}|${folder}|${retry}`;
+    const auto = Boolean(job.autoRetryAt);
+    const key = `${pending}|${folder}|${retry}|${auto}`;
     if (key === card.actionsKey) return;
     card.actionsKey = key;
 
     const buttons = [];
     if (folder) {
         buttons.push(
-            textButton(SVG_FOLDER_OPEN(16), 'Show in folder', 'Opens your system file dialog in this folder', () => {
+            textButton(SVG_FOLDER_OPEN(16), 'Show in folder', SHOW_IN_FOLDER_HINT, () => {
                 const current = card.job;
                 const firstSaved = current.items.find((item) => item.status === 'done')?.path;
                 showInFolder(current.destination, firstSaved).catch(reportError);
@@ -354,10 +370,19 @@ function updateActions(card, job) {
             )
         );
     }
+    if (auto) {
+        buttons.push(
+            textButton(SVG_CLOSE(16), 'Stop retrying', 'Stop retrying the missing tracks automatically', () =>
+                cancelDownloadJob(card.job.id)
+            )
+        );
+    }
     buttons.push(
         pending
             ? iconButton(SVG_CLOSE(18), 'Cancel', () => cancelDownloadJob(card.job.id))
-            : iconButton(SVG_BIN(16), 'Remove from list (keeps the files)', () => removeDownloadJob(card.job.id))
+            : iconButton(SVG_BIN(16), 'Remove from list (keeps the files, stops retrying)', () =>
+                  removeDownloadJob(card.job.id)
+              )
     );
     buttons.push(card.expandBtn);
     card.actions.replaceChildren(...buttons);

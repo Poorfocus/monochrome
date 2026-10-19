@@ -29,3 +29,5 @@ bun.lockb,
 bun.lock
 .wrangler
 .opencode
+# Desktop app builds (electron-builder)
+release/

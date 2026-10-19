@@ -14,7 +14,7 @@ import { modernSettings } from './ModernSettings';
 export type DownloadJobKind = 'track' | 'album' | 'playlist' | 'queue' | 'liked' | 'discography';
 export type DownloadItemStatus = 'queued' | 'downloading' | 'done' | 'failed' | 'cancelled';
 export type DownloadJobStatus = 'queued' | 'active' | 'done' | 'partial' | 'failed' | 'cancelled';
-export type DownloadDestinationMethod = 'folder' | 'local' | 'zip' | 'browser';
+export type DownloadDestinationMethod = 'folder' | 'local' | 'zip' | 'browser' | 'desktop';
 
 export interface DownloadDestination {
     method: DownloadDestinationMethod;
@@ -34,6 +34,7 @@ export interface TrackLike {
     album?: { title?: string; cover?: string | null };
     cover?: string | null;
     type?: string;
+    provider?: string;
 }
 
 /** Just enough of a track to show it and download it again. */
@@ -44,6 +45,7 @@ export interface DownloadTrackSnapshot {
     albumTitle?: string;
     cover?: string | null;
     type?: string;
+    provider?: string;
 }
 
 export interface DownloadItem {
@@ -64,6 +66,8 @@ export interface DownloadItem {
 export interface DownloadJobSource {
     kind: 'track' | 'album' | 'tracks' | 'discography';
     id?: string | number;
+    /** Catalog the ID belongs to ('tracks' for the monochrome catalog); needed to look it up after a reload. */
+    provider?: string;
     artist?: { id?: string | number; name: string };
     releases?: { id: string | number; title?: string; cover?: string | null }[];
 }
@@ -80,6 +84,10 @@ export interface DownloadJob {
     status: DownloadJobStatus;
     createdAt: number;
     finishedAt?: number;
+    /** How many automatic retries came before this run (0 for a fresh download). */
+    attempt?: number;
+    /** When the app will retry the tracks this job is missing; cleared to stop it. */
+    autoRetryAt?: number;
     destination?: DownloadDestination;
     source?: DownloadJobSource;
     items: DownloadItem[];
@@ -194,6 +202,7 @@ export function snapshotTrack(track: TrackLike): DownloadTrackSnapshot {
         albumTitle: track?.album?.title,
         cover: track?.album?.cover || track?.cover || null,
         type: track?.type,
+        provider: track?.provider,
     };
 }
 
@@ -206,6 +215,7 @@ export function startDownloadJob(init: {
     folderName?: string;
     tracks?: TrackLike[];
     source?: DownloadJobSource;
+    attempt?: number;
     onCancel?: () => void;
 }): string {
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -219,6 +229,7 @@ export function startDownloadJob(init: {
             quality: init.quality,
             folderName: init.folderName,
             source: init.source,
+            attempt: init.attempt,
             status: 'queued',
             createdAt: Date.now(),
             items: (init.tracks || []).map((track) => newItem(track)),
@@ -325,9 +336,22 @@ export function queuePosition(jobId: string, list: readonly DownloadJob[] = jobs
     return waiting.findIndex((job) => job.id === jobId) + 1;
 }
 
+/** Sets or clears (undefined) the time the app will retry a finished job's missing tracks. */
+export function setJobAutoRetry(jobId: string, at: number | undefined) {
+    const job = findJob(jobId);
+    if (!job) return;
+    job.autoRetryAt = at;
+    changed(true);
+}
+
 export function cancelDownloadJob(jobId: string) {
     const job = findJob(jobId);
     if (!job) return;
+    if (!isPending(job)) {
+        // Already finished: this stops any automatic retry.
+        setJobAutoRetry(jobId, undefined);
+        return;
+    }
     const cancel = cancelHandlers.get(jobId);
     if (job.status === 'queued') {
         runners.delete(jobId);

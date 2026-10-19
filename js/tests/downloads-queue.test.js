@@ -4,9 +4,9 @@ import { beforeAll, describe, expect, test, vi } from 'vitest';
 vi.mock('../music-api.js', () => ({ MusicAPI: { instance: null } }));
 vi.mock('../lyrics.js', () => ({ LyricsManager: { instance: null } }));
 
-const { downloadAlbum } = await import('../downloads.js');
+const { downloadAlbum, setRetryTiming } = await import('../downloads.js');
 const { modernSettings, BulkDownloadMethod } = await import('../ModernSettings.ts');
-const { getDownloadJobs } = await import('../download-manager.ts');
+const { getDownloadJobs, cancelDownloadJob, removeDownloadJob } = await import('../download-manager.ts');
 
 const FLAC = new Uint8Array(4096);
 FLAC.set([0x66, 0x4c, 0x61, 0x43]); // "fLaC"
@@ -19,13 +19,16 @@ async function makeCoverUrl() {
     return URL.createObjectURL(blob);
 }
 
-function fakeApi(coverUrl) {
-    const state = { running: 0, maxRunning: 0, order: [] };
+function fakeApi(coverUrl, { failures = {} } = {}) {
+    // failures: { trackId: number of times downloadTrack should fail before it works }
+    const state = { running: 0, maxRunning: 0, order: [], attempts: {} };
     return {
         state,
         getCoverUrl: () => coverUrl,
         getTrackMetadata: async (id) => ({ id }),
         async downloadTrack(id) {
+            state.attempts[id] = (state.attempts[id] || 0) + 1;
+            if (state.attempts[id] <= (failures[id] || 0)) throw new Error('Download failed: Fetch failed: 502');
             state.running++;
             state.maxRunning = Math.max(state.maxRunning, state.running);
             state.order.push(id);
@@ -119,4 +122,77 @@ describe('queued album downloads', () => {
         ]);
         expect(secondJob.destination).toMatchObject({ method: 'folder', label: 'queue-test' });
     }, 30000);
+
+    describe('retrying failed tracks', () => {
+        const jobFor = (title) => getDownloadJobs().find((j) => j.title === title);
+        const filesIn = async (folder) => {
+            const dir = await root.getDirectoryHandle(folder);
+            return (await listFiles(dir)).filter((f) => f.endsWith('.flac'));
+        };
+
+        test('a track that fails is retried until it downloads', async () => {
+            setRetryTiming({ inlineBaseMs: 50, inlineRounds: 4, autoBaseMs: 100, autoMaxMs: 400 });
+            const api = fakeApi(await makeCoverUrl(), { failures: { 'r1-2': 3 } });
+            const rec = album('r1', 'Flaky Album', 'Flaky Artist', 3);
+            await downloadAlbum(rec.meta, rec.tracks, api, 'LOSSLESS');
+
+            await vi.waitFor(() => expect(jobFor('Flaky Album')?.status).toBe('done'), {
+                timeout: 20000,
+                interval: 50,
+            });
+            expect(api.state.attempts['r1-2']).toBe(4);
+            expect(await filesIn('Flaky Album - Flaky Artist')).toHaveLength(3);
+            // Playlist files list every track, including the one that needed retries.
+            const dir = await root.getDirectoryHandle('Flaky Album - Flaky Artist');
+            const files = await listFiles(dir);
+            expect(files.some((f) => f.endsWith('.m3u'))).toBe(true);
+        }, 30000);
+
+        test('a track that outlasts the album is retried by a later run until it downloads', async () => {
+            setRetryTiming({ inlineBaseMs: 20, inlineRounds: 2, autoBaseMs: 100, autoMaxMs: 300 });
+            // 1 first attempt + 2 inline rounds fail, then the re-queued run's first attempt fails, then it works.
+            const api = fakeApi(await makeCoverUrl(), { failures: { 'r2-1': 4 } });
+            const rec = album('r2', 'Stubborn Album', 'Stubborn Artist', 2);
+            await downloadAlbum(rec.meta, rec.tracks, api, 'LOSSLESS');
+
+            await vi.waitFor(() => expect(jobFor('Stubborn Album')?.status).toBe('partial'), {
+                timeout: 20000,
+                interval: 20,
+            });
+            expect(jobFor('Stubborn Album').autoRetryAt).toBeGreaterThan(Date.now() - 1000);
+
+            await vi.waitFor(
+                () => {
+                    const jobs = getDownloadJobs().filter((j) => j.title === 'Stubborn Album');
+                    expect(jobs).toHaveLength(1);
+                    expect(jobs[0].status).toBe('done');
+                },
+                { timeout: 30000, interval: 50 }
+            );
+            expect(await filesIn('Stubborn Album - Stubborn Artist')).toHaveLength(2);
+            // The track that already downloaded was not fetched again.
+            expect(api.state.attempts['r2-2']).toBe(1);
+        }, 45000);
+
+        test('stopping the retry keeps the job as it is', async () => {
+            setRetryTiming({ inlineBaseMs: 20, inlineRounds: 1, autoBaseMs: 400, autoMaxMs: 400 });
+            const api = fakeApi(await makeCoverUrl(), { failures: { 'r3-1': 99 } });
+            const rec = album('r3', 'Broken Album', 'Broken Artist', 1);
+            await downloadAlbum(rec.meta, rec.tracks, api, 'LOSSLESS');
+
+            await vi.waitFor(() => expect(jobFor('Broken Album')?.autoRetryAt).toBeTruthy(), {
+                timeout: 20000,
+                interval: 20,
+            });
+            const job = jobFor('Broken Album');
+            cancelDownloadJob(job.id);
+            expect(jobFor('Broken Album').autoRetryAt).toBeUndefined();
+
+            const attemptsBefore = api.state.attempts['r3-1'];
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            expect(api.state.attempts['r3-1']).toBe(attemptsBefore);
+            expect(jobFor('Broken Album').status).toBe('failed');
+            removeDownloadJob(job.id);
+        }, 30000);
+    });
 });

@@ -1,4 +1,5 @@
 import type { DownloadDestination } from './download-manager';
+import { desktop } from './desktop-bridge';
 
 /**
  * Finding saved downloads again. A web page cannot open the system file
@@ -7,6 +8,7 @@ import type { DownloadDestination } from './download-manager';
  */
 
 export function canShowInFolder(destination: DownloadDestination | undefined): boolean {
+    if (destination?.method === 'desktop') return desktop !== null;
     if (!destination?.handle || typeof window.showOpenFilePicker !== 'function') return false;
     return destination.method === 'folder' || destination.method === 'local' || destination.method === 'zip';
 }
@@ -16,6 +18,10 @@ export function describeSavedPath(destination: DownloadDestination | undefined, 
     if (!destination) return path || '';
     const fileName = path?.split('/').pop() || '';
     switch (destination.method) {
+        case 'desktop': {
+            const sep = destination.label.includes('\\') ? '\\' : '/';
+            return path ? `${destination.label}${sep}${path.split('/').join(sep)}` : destination.label;
+        }
         case 'folder':
         case 'local':
             return path ? `${destination.label}/${path}` : destination.label;
@@ -43,6 +49,11 @@ async function folderForPath(root: FileSystemDirectoryHandle, path: string | und
  * destination root). Must be called from a click.
  */
 export async function showInFolder(destination: DownloadDestination, path?: string): Promise<void> {
+    // The desktop app opens the real file explorer with the file selected.
+    if (destination.method === 'desktop') {
+        await desktop?.showInFolder(path || '');
+        return;
+    }
     const handle = destination.handle;
     if (!handle) return;
 
