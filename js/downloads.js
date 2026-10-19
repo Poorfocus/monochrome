@@ -612,11 +612,12 @@ function removeBulkDownloadTask(notifEl) {
     }, 300);
 }
 
-async function downloadTrackBlob(track, quality, api, signal = null, onProgress = null) {
+async function downloadTrackBlob(track, quality, api, signal = null, onProgress = null, onQuality = null) {
     const blob = await api.downloadTrack(track.id, quality, undefined, {
         track,
         signal,
         onProgress,
+        onQuality,
         triggerDownload: false,
         calculateDashBytes: false,
     });
@@ -643,20 +644,28 @@ async function fetchTrack({ track, itemIndex, quality, api, signal, jobId, onPro
 
     const startedAt = performance.now();
     let lastSpeedUpdate = 0;
-    const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, (p) => {
-        const fraction = progressFraction(p);
-        if (fraction !== null) {
-            const patch = { progress: Math.min(fraction, 0.99) };
-            // Speed of the stream so far, refreshed about twice a second.
-            const now = performance.now();
-            if (p?.receivedBytes && now - lastSpeedUpdate > 500) {
-                lastSpeedUpdate = now;
-                patch.speed = p.receivedBytes / ((now - startedAt) / 1000);
+    const onQuality = (delivered) => updateDownloadItem(jobId, itemIndex, { quality: delivered });
+    const { blob, extension } = await downloadTrackBlob(
+        track,
+        quality,
+        api,
+        signal,
+        (p) => {
+            const fraction = progressFraction(p);
+            if (fraction !== null) {
+                const patch = { progress: Math.min(fraction, 0.99) };
+                // Speed of the stream so far, refreshed about twice a second.
+                const now = performance.now();
+                if (p?.receivedBytes && now - lastSpeedUpdate > 500) {
+                    lastSpeedUpdate = now;
+                    patch.speed = p.receivedBytes / ((now - startedAt) / 1000);
+                }
+                updateDownloadItem(jobId, itemIndex, patch);
             }
-            updateDownloadItem(jobId, itemIndex, patch);
-        }
-        onProgress?.(p, fraction);
-    });
+            onProgress?.(p, fraction);
+        },
+        onQuality
+    );
     return { blob, extension };
 }
 
@@ -1931,6 +1940,7 @@ async function runTrackDownload({
             signal: controller.signal,
             track: enrichedTrack,
             enriched,
+            onQuality: (delivered) => updateDownloadItem(jobId, 0, { quality: delivered }),
             onProgress: (progress) => {
                 updateDownloadProgress(track.id, progress);
                 const fraction = progressFraction(progress);

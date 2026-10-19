@@ -4,6 +4,7 @@ import {
     cancelDownloadJob,
     clearFinishedDownloads,
     countActiveDownloads,
+    fellBackTo16Bit,
     queuePosition,
     removeDownloadJob,
     subscribeDownloads,
@@ -162,8 +163,12 @@ function jobStatusText(job) {
             const now = running.length > 1 ? `${running.length} at once` : current?.track.title;
             return [`${done}/${total}`, now, speed].filter(Boolean).join(' · ');
         }
-        case 'done':
-            return [total > 1 ? `${total} tracks` : 'Saved', size].filter(Boolean).join(' · ');
+        case 'done': {
+            const in16 = job.items.filter((item) => fellBackTo16Bit(job, item)).length;
+            return [total > 1 ? `${total} tracks` : 'Saved', size, in16 ? `${in16} in 16-bit` : '']
+                .filter(Boolean)
+                .join(' · ');
+        }
         case 'partial':
             return `${done}/${total} saved · ${failed} failed${retryNote(job)}`;
         case 'cancelled':
@@ -203,7 +208,7 @@ function formatSpeed(bytesPerSecond) {
     return `${(bytesPerSecond / 1048576).toFixed(1)} MB/s`;
 }
 
-function itemDetail(item) {
+function itemDetail(item, job) {
     // Retry countdowns and the last error while a track waits for its next attempt.
     if (item.statusText && (item.status === 'queued' || item.status === 'failed')) return item.statusText;
     switch (item.status) {
@@ -212,7 +217,9 @@ function itemDetail(item) {
         case 'failed':
             return item.error || 'Failed';
         case 'done':
-            return formatBytes(item.bytes);
+            return [formatBytes(item.bytes), job && fellBackTo16Bit(job, item) ? '16-bit (no hi-res)' : '']
+                .filter(Boolean)
+                .join(' · ');
         case 'cancelled':
             return 'Cancelled';
         default:
@@ -259,7 +266,7 @@ function updateTrackRow(row, job, item, index, number) {
     refs.meta.title = savedAt;
     refs.progress.style.display = item.status === 'downloading' ? '' : 'none';
     refs.fill.style.width = `${item.progress * 100}%`;
-    refs.detail.textContent = itemDetail(item);
+    refs.detail.textContent = itemDetail(item, job);
     refs.detail.classList.toggle('is-failed', item.status === 'failed');
 
     const showFolder = item.status === 'done' && canShowInFolder(job.destination);

@@ -3022,13 +3022,19 @@ export class LosslessAPI {
         return result;
     }
 
+    /**
+     * Qualities to try for one track, best first. A track that can't be had
+     * in the chosen quality steps down to 16-bit lossless, never to lossy
+     * AAC: a lossy file would count as a success and never be retried.
+     */
     getDownloadQualityLadder(quality) {
         const normalized = normalizeQualityToken(quality) || quality || 'LOSSLESS';
-        if (isAtmosQuality(normalized)) return [normalized, 'HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH'];
-        if (normalized === 'HI_RES_LOSSLESS') return ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-        if (normalized === 'LOSSLESS') return ['LOSSLESS', 'HIGH', 'LOW'];
+        if (isAtmosQuality(normalized)) return [normalized, 'HI_RES_LOSSLESS', 'LOSSLESS'];
+        if (normalized === 'HI_RES_LOSSLESS') return ['HI_RES_LOSSLESS', 'LOSSLESS'];
+        if (normalized === 'LOSSLESS') return ['LOSSLESS'];
         if (normalized === 'HIGH' || normalized === 'NORMAL') return [normalized, 'LOW'];
-        return [normalized, 'LOSSLESS', 'HIGH', 'LOW'];
+        if (normalized === 'LOW') return ['LOW'];
+        return [normalized, 'LOSSLESS'];
     }
 
     dropCachedStreams(id) {
@@ -3127,6 +3133,8 @@ export class LosslessAPI {
                 playbackType: prepared.externalStreamType,
                 provider: prepared.externalProvider || 'monochrome',
                 quality: prepared.lookup?.info?.audioQuality || quality,
+                // The monochrome server only serves 16-bit FLAC, whatever was asked for.
+                delivered: 'LOSSLESS',
                 label: 'monochrome',
             });
         } else if (prepared?.lookup?.originalTrackUrl) {
@@ -3146,6 +3154,7 @@ export class LosslessAPI {
                         playbackType: stream.playbackType,
                         provider: stream.provider || 'monochrome',
                         quality: stream.quality || quality,
+                        delivered: 'LOSSLESS',
                         label: 'monochrome',
                     });
                 }
@@ -3391,6 +3400,9 @@ export class LosslessAPI {
                             });
                             await this.assertUsableMedia(blob);
                             postProcessingQuality = source.quality || candidateQuality;
+                            options.onQuality?.(
+                                normalizeQualityToken(source.delivered || source.quality) || candidateQuality
+                            );
                             break;
                         } catch (sourceError) {
                             if (sourceError?.name === 'AbortError') throw sourceError;

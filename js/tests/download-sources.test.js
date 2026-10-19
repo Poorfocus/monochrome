@@ -159,4 +159,45 @@ describe('download sources', () => {
             expect(api.searchTracksByIsrc).not.toHaveBeenCalled();
         });
     });
+
+    describe('quality fallback', () => {
+        test('hi-res steps down to 16-bit lossless and stops there', () => {
+            expect(api.getDownloadQualityLadder('HI_RES_LOSSLESS')).toEqual(['HI_RES_LOSSLESS', 'LOSSLESS']);
+        });
+
+        test('a lossless request never falls back to lossy AAC', () => {
+            expect(api.getDownloadQualityLadder('LOSSLESS')).toEqual(['LOSSLESS']);
+            for (const quality of ['HI_RES_LOSSLESS', 'LOSSLESS', 'DOLBY_ATMOS_EAC3_HIGH']) {
+                expect(api.getDownloadQualityLadder(quality)).not.toContain('HIGH');
+                expect(api.getDownloadQualityLadder(quality)).not.toContain('LOW');
+            }
+        });
+
+        test('Atmos falls back to hi-res, then 16-bit', () => {
+            expect(api.getDownloadQualityLadder('DOLBY_ATMOS_EAC3_HIGH')).toEqual([
+                'DOLBY_ATMOS_EAC3_HIGH',
+                'HI_RES_LOSSLESS',
+                'LOSSLESS',
+            ]);
+        });
+
+        test('lossy requests keep their own step down', () => {
+            expect(api.getDownloadQualityLadder('HIGH')).toEqual(['HIGH', 'LOW']);
+            expect(api.getDownloadQualityLadder('LOW')).toEqual(['LOW']);
+        });
+
+        test('the monochrome server reports 16-bit even when hi-res was asked for', async () => {
+            const sources = [];
+            for await (const source of api.iterateDownloadSources(
+                CATALOG_ID,
+                'HI_RES_LOSSLESS',
+                catalogTrack,
+                null,
+                new Set()
+            )) {
+                sources.push(source);
+            }
+            expect(sources.find((source) => source.label === 'monochrome').delivered).toBe('LOSSLESS');
+        });
+    });
 });
