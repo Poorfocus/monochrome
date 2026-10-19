@@ -22,6 +22,7 @@ import { Player } from './player.js';
 import { MultiScrobbler } from './multi-scrobbler.js';
 import { LyricsManager, openLyricsPanel, clearLyricsPanelSync } from './lyrics.js';
 import { createRouter, updateTabTitle, navigate } from './router.js';
+import { initDownloadsPage } from './downloads-page.js';
 import { initializePlayerEvents, initializeTrackInteractions, handleTrackAction } from './events.js';
 import { initializeUIInteractions, updateLocalFilesSupportUI } from './ui-interactions.js';
 import { debounce, getShareUrl, normalizeQualityToken, sanitizeForFilename } from './utils.js';
@@ -2545,6 +2546,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     document.querySelector('.now-playing-bar .play-pause-btn').innerHTML = SVG_PLAY(20);
 
+    initDownloadsPage();
     const router = createRouter(UIRenderer.instance);
 
     // Navigations (search submit, suggestion clicks, links) can fire while the

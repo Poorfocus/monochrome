@@ -76,13 +76,34 @@ export { sequentialFileWriter as SequentialFileWriter };
  * Prompts the user to choose a save location with showSaveFilePicker.
  */
 export class ZipStreamWriter implements IBulkDownloadWriter {
+    private fileHandle: FileSystemFileHandle | null = null;
+
     constructor(private readonly suggestedFilename: string) {}
 
-    async write(files: AsyncIterable<WriterEntry>): Promise<void> {
-        const fileHandle = await window.showSaveFilePicker({
+    /**
+     * Shows the save dialog now. Call this from the click that started the
+     * download: a queued download may only write minutes later, when the
+     * browser no longer allows opening the dialog.
+     */
+    async pickFile(): Promise<FileSystemFileHandle> {
+        this.fileHandle ??= await window.showSaveFilePicker({
             suggestedName: this.suggestedFilename,
             types: [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }],
         });
+        return this.fileHandle;
+    }
+
+    /** The chosen archive, once {@link pickFile} has run. */
+    getFileHandle(): FileSystemFileHandle | null {
+        return this.fileHandle;
+    }
+
+    async write(files: AsyncIterable<WriterEntry>): Promise<void> {
+        const fileHandle = await this.pickFile();
+        // Access to the picked file can lapse while the job waits in the queue.
+        if (!(await ensureFolderWritePermission(fileHandle))) {
+            throw new DOMException(`No write access to ${fileHandle.name}`, 'NotAllowedError');
+        }
         const { downloadZip } = await loadClientZip();
         const writable = await fileHandle.createWritable();
         const response = downloadZip(files);
