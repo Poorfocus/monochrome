@@ -29,13 +29,9 @@ describe('proxy-utils', () => {
         );
     });
 
-    test('tries the direct download URL before CORS proxies', () => {
+    test('downloads straight from the source URL without third-party proxies', () => {
         const url = 'https://cdn.example.com/audio/1.flac';
-        expect(downloadFetchEndpoints(url)).toEqual([
-            url,
-            `https://corsproxy.io/?${encodeURIComponent(url)}`,
-            `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-        ]);
+        expect(downloadFetchEndpoints(url)).toEqual([url]);
         expect(downloadFetchEndpoints('blob:http://localhost/1')).toEqual(['blob:http://localhost/1']);
     });
 });

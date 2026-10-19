@@ -3059,6 +3059,24 @@ export class LosslessAPI {
             yield source;
         };
 
+        // Videos only have the video manifest; the track sources below would
+        // resolve audio (or nothing) for a video ID.
+        if (prepared?.isVideo || track?.type?.toLowerCase?.().includes('video')) {
+            try {
+                const url = await this.getVideoStreamUrl(id);
+                yield* yieldNew({
+                    url,
+                    playbackType: this.streamKind(url),
+                    provider: 'video',
+                    quality,
+                    label: 'video',
+                });
+            } catch (error) {
+                console.warn(`Video stream lookup failed for ${id}:`, error?.message || error);
+            }
+            return;
+        }
+
         if (prepared?.externalStreamUrl) {
             yield* yieldNew({
                 url: prepared.externalStreamUrl,
@@ -3303,7 +3321,7 @@ export class LosslessAPI {
                         if (options.signal?.aborted) {
                             throw new DOMException('The operation was aborted.', 'AbortError');
                         }
-                        console.info(`Downloading ${id} via ${source.label} at ${candidateQuality}`);
+                        console.log(`Downloading ${id} via ${source.label} at ${candidateQuality}`);
                         try {
                             blob = await this.downloadSourceBlob(source, {
                                 signal: options.signal,

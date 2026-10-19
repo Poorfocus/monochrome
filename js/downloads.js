@@ -15,6 +15,7 @@ import {
 import { lyricsSettings, playlistSettings } from './storage.js';
 import { generateM3U, generateM3U8, generateCUE, generateNFO, generateJSON } from './playlist-generator.js';
 import { ZipStreamWriter, ZipBlobWriter, FolderPickerWriter, SequentialFileWriter } from './bulk-download-writer.ts';
+import { ensureFolderWritePermission, setFolderAccessPrompt } from './folder-permission.ts';
 import { FfmpegProgress } from './ffmpeg.types.js';
 import { DownloadProgress, ProgressMessage, SegmentedDownloadProgress } from './progressEvents.js';
 import { db } from './db.js';
@@ -197,6 +198,50 @@ export function showNotification(message, options = {}) {
         isError ? 10000 : 1500
     );
 }
+
+/**
+ * In-app prompt shown when the browser has dropped write access to the
+ * download folder. The browser only re-grants access from a click, so the
+ * waiting download resumes when the user presses "Allow".
+ */
+function promptForFolderAccess(grant) {
+    return new Promise((resolve) => {
+        const container = createDownloadNotification();
+        const el = document.createElement('div');
+        el.className = 'download-task';
+
+        const message = document.createElement('div');
+        message.className = 'notification-message';
+        message.textContent = 'The browser paused access to your download folder. Allow access to keep saving there.';
+
+        const actions = document.createElement('div');
+        actions.style.cssText = 'display: flex; gap: 0.5rem; margin-top: 0.5rem;';
+        const allowBtn = document.createElement('button');
+        allowBtn.type = 'button';
+        allowBtn.className = 'btn-primary';
+        allowBtn.textContent = 'Allow';
+        const skipBtn = document.createElement('button');
+        skipBtn.type = 'button';
+        skipBtn.className = 'btn-secondary';
+        skipBtn.textContent = 'Use browser downloads';
+        actions.append(allowBtn, skipBtn);
+
+        el.append(message, actions);
+        container.appendChild(el);
+
+        const finish = (granted) => {
+            el.remove();
+            resolve(granted);
+        };
+        allowBtn.addEventListener('click', async () => {
+            allowBtn.disabled = true;
+            finish(await grant());
+        });
+        skipBtn.addEventListener('click', () => finish(false));
+    });
+}
+
+setFolderAccessPrompt(promptForFolderAccess);
 
 export function addDownloadTask(trackId, track, _filename, api, abortController) {
     const container = createDownloadNotification();
@@ -563,12 +608,7 @@ async function createSingleTrackFolderWriter() {
     if (method === BulkDownloadMethod.LocalMedia) {
         const localHandle = await db.getSetting('local_folder_handle');
         if (hasFolderPicker && localHandle && typeof localHandle.requestPermission === 'function') {
-            try {
-                const permission = await localHandle.requestPermission({ mode: 'readwrite' });
-                if (permission === 'granted') return FolderPickerWriter.fromHandle(localHandle);
-            } catch {
-                // no permission
-            }
+            if (await ensureFolderWritePermission(localHandle)) return FolderPickerWriter.fromHandle(localHandle);
         }
         return null;
     }
@@ -576,14 +616,9 @@ async function createSingleTrackFolderWriter() {
     if (method === BulkDownloadMethod.Folder && hasFolderPicker) {
         const rememberFolder = modernSettings.rememberBulkDownloadFolder;
         const savedHandle = rememberFolder ? await db.getSetting('bulk_download_folder_handle') : null;
-        // Try to reuse the saved handle silently first.
+        // Try to reuse the saved handle first.
         if (savedHandle && typeof savedHandle.requestPermission === 'function') {
-            try {
-                const permission = await savedHandle.requestPermission({ mode: 'readwrite' });
-                if (permission === 'granted') return FolderPickerWriter.fromHandle(savedHandle);
-            } catch {
-                // fall through to picker
-            }
+            if (await ensureFolderWritePermission(savedHandle)) return FolderPickerWriter.fromHandle(savedHandle);
         }
         // No usable saved handle - open the picker so the user can choose a folder.
         try {
@@ -621,13 +656,8 @@ async function createBulkWriter(folderName) {
         if (hasFolderPicker) {
             // Browser mode: try to reuse the stored handle with write permission
             if (localHandle && typeof localHandle.requestPermission === 'function') {
-                try {
-                    const permission = await localHandle.requestPermission({ mode: 'readwrite' });
-                    if (permission === 'granted') {
-                        return FolderPickerWriter.fromHandle(localHandle);
-                    }
-                } catch {
-                    // fall through to picker
+                if (await ensureFolderWritePermission(localHandle)) {
+                    return FolderPickerWriter.fromHandle(localHandle);
                 }
             }
             // No usable handle - prompt and persist
@@ -1174,22 +1204,27 @@ export async function downloadTrackWithMetadata(
     // cannot start multiple enrichments for the same track.
     ongoingDownloads.add(downloadKey);
 
+    // Resolve the folder writer first, while the click that started the download
+    // still counts as user activation for the permission prompt, and before the
+    // UI task appears.
+    let folderWriter;
+    try {
+        folderWriter = (await createSingleTrackFolderWriter()) || SequentialFileWriter;
+    } catch (error) {
+        console.warn('Could not open the download folder, using browser downloads:', error);
+        folderWriter = SequentialFileWriter;
+    }
+
     let enriched = null;
     try {
         enriched = await tidalAPI.enrichTrack(track, { downloadQuality: quality });
     } catch (error) {
-        console.warn(
-            `Enrichment failed before download (${friendlyEnrichError(error)}). Trying alternate sources.`
-        );
+        console.warn(`Enrichment failed before download (${friendlyEnrichError(error)}). Trying alternate sources.`);
     }
     const enrichedTrack = enriched?.enrichedTrack || track;
     const filename = buildTrackFilename(enrichedTrack, quality);
 
     try {
-        // Resolve the folder writer before registering the download task so that
-        // any permission prompt (requestPermission) shows before the UI task appears.
-        const folderWriter = (await createSingleTrackFolderWriter()) || SequentialFileWriter;
-
         addDownloadTask(track.id, enrichedTrack, filename, api, controller);
 
         // Download the blob (metadata already applied inside downloadTrack)

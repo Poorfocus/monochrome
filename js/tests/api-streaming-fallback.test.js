@@ -38,7 +38,11 @@ vi.mock('../cache.js', () => ({
 
 vi.mock('../dash-downloader.ts', () => ({ DashDownloader: class {} }));
 vi.mock('../hls-downloader.js', () => ({ HlsDownloader: class {} }));
-vi.mock('../proxy-utils.js', () => ({ getProxyUrl: vi.fn((url) => url), wrapTidalUrl: vi.fn((url) => url) }));
+vi.mock('../proxy-utils.js', () => ({
+    getProxyUrl: vi.fn((url) => url),
+    wrapTidalUrl: vi.fn((url) => url),
+    fetchDownload: vi.fn((url, { attempts: _attempts, ...init } = {}) => fetch(url, init)),
+}));
 vi.mock('../ffmpeg.js', () => ({ loadFfmpeg: vi.fn(), FfmpegError: class extends Error {}, ffmpeg: vi.fn() }));
 vi.mock('../download-utils.ts', () => ({ triggerDownload: vi.fn(), applyAudioPostProcessing: vi.fn() }));
 vi.mock('../ffmpegFormats.ts', () => ({ isCustomFormat: vi.fn(() => false) }));

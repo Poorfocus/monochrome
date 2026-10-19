@@ -8,28 +8,17 @@ export const getProxyUrl = (url) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Ordered fetch targets for a download URL. Direct first, then CORS proxies
- * already used elsewhere in the app when the CDN blocks the browser.
+ * Fetch targets for a download URL. Public CORS proxies (corsproxy.io,
+ * allorigins) are deliberately not used: they would receive signed stream
+ * URLs, block or size-limit audio from production origins, and turn each
+ * failed request into extra timeouts.
  * @param {string} url
  * @returns {string[]}
  */
 export function downloadFetchEndpoints(url) {
-    if (!url || url.startsWith('blob:') || url.startsWith('data:')) return [url];
-    if (/corsproxy\.io|allorigins\.win/i.test(url)) return [url];
-
-    return [
-        url,
-        `https://corsproxy.io/?${encodeURIComponent(url)}`,
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    ];
+    return [url];
 }
 
-/**
- * Fetches a download URL, retrying transient failures and walking alternate endpoints.
- * @param {string} url
- * @param {RequestInit & { attempts?: number }} [options]
- * @returns {Promise<Response>}
- */
 function combineSignals(signals) {
     const active = signals.filter(Boolean);
     if (active.length === 0) return undefined;
@@ -47,6 +36,12 @@ function combineSignals(signals) {
     return controller.signal;
 }
 
+/**
+ * Fetches a download URL, retrying transient failures with backoff.
+ * @param {string} url
+ * @param {RequestInit & { attempts?: number }} [options]
+ * @returns {Promise<Response>}
+ */
 export async function fetchDownload(url, options = {}) {
     const { attempts = 2, signal, timeoutMs = 15000, ...init } = options;
     const endpoints = downloadFetchEndpoints(url);
