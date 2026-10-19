@@ -5591,6 +5591,20 @@
                                 </div>
                                 <div class="setting-item">
                                     <div class="info">
+                                        <span class="label">Download Source</span>
+                                        <span class="description"
+                                            >Which stream host downloads try first. If one fails, the others are tried
+                                            automatically. Run "bun run bench:hosts" to see which is fastest on your
+                                            connection</span
+                                        >
+                                    </div>
+                                    <select id="download-source-setting">
+                                        <option value="auto">Monochrome server, then HiFi hosts</option>
+                                        <option value="hifi-first">HiFi hosts, then monochrome server</option>
+                                    </select>
+                                </div>
+                                <div class="setting-item">
+                                    <div class="info">
                                         <span class="label">Simultaneous Track Downloads</span>
                                         <span class="description"
                                             >How many tracks of an album download at once. Albums still run one at a

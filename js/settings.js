@@ -1340,6 +1340,15 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         updateDownloadLocationUI();
     }
 
+    const downloadSourceSelect = document.getElementById('download-source-setting');
+    if (downloadSourceSelect) {
+        await modernSettings.waitPending();
+        downloadSourceSelect.value = modernSettings.downloadSourcePreference;
+        downloadSourceSelect.addEventListener('change', (e) => {
+            modernSettings.downloadSourcePreference = e.target.value;
+        });
+    }
+
     const downloadConcurrencySelect = document.getElementById('download-concurrency-setting');
     if (downloadConcurrencySelect) {
         await modernSettings.waitPending();

@@ -24,6 +24,7 @@ import { DashDownloader } from './dash-downloader.ts';
 import { HlsDownloader } from './hls-downloader.js';
 import { fetchDownload, getProxyUrl, wrapTidalUrl } from './proxy-utils.js';
 import { loadFfmpeg, FfmpegError, ffmpeg } from './ffmpeg.js';
+import { modernSettings } from './ModernSettings.js';
 import { triggerDownload, applyAudioPostProcessing } from './download-utils.ts';
 import { isCustomFormat } from './ffmpegFormats.ts';
 import { DownloadProgress } from './progressEvents.js';
@@ -3077,6 +3078,49 @@ export class LosslessAPI {
             return;
         }
 
+        // Which host serves the audio first. "Automatic" starts with the monochrome server and
+        // falls back to the HiFi hosts; "hifi-first" does the reverse (try it if downloads are slow).
+        const order =
+            modernSettings.downloadSourcePreference === 'hifi-first'
+                ? ['hifiSources', 'monochromeSources']
+                : ['monochromeSources', 'hifiSources'];
+        for (const name of order) {
+            yield* this[name](id, quality, track, prepared, yieldNew);
+        }
+
+        const isrc = track?.isrc;
+        if (isrc && deezerFallbackSettings.isEnabled()) {
+            const baseUrl = deezerFallbackSettings.getApiBaseUrl().replace(/\/+$/, '');
+            if (baseUrl) {
+                const format = this.getDeezerStreamFormat(quality);
+                yield* yieldNew({
+                    url: `${baseUrl}/stream/?isrc=${encodeURIComponent(isrc)}&format=${encodeURIComponent(format)}`,
+                    playbackType: 'direct',
+                    provider: 'deezer',
+                    quality,
+                    label: 'deezer',
+                });
+            }
+        }
+
+        try {
+            const unified = await this.getUnifiedPlaybackStreamUrl(id, quality, { track, intent: 'download' });
+            if (unified?.url) {
+                yield* yieldNew({
+                    url: unified.url,
+                    playbackType: unified.playbackType,
+                    provider: unified.provider || 'unified',
+                    quality: unified.quality || quality,
+                    label: 'unified',
+                });
+            }
+        } catch (error) {
+            console.warn(`Unified playback lookup failed for ${id}:`, error?.message || error);
+        }
+    }
+
+    /** Stream from the monochrome server (tracks.monochrome.st), the catalog the app searches. */
+    async *monochromeSources(id, quality, track, prepared, yieldNew) {
         if (prepared?.externalStreamUrl) {
             yield* yieldNew({
                 url: prepared.externalStreamUrl,
@@ -3109,9 +3153,21 @@ export class LosslessAPI {
                 console.warn(`Monochrome stream lookup failed for ${id}:`, error);
             }
         }
+    }
 
+    /**
+     * Stream from the HiFi hosts: look the track up on a host and download the
+     * link it returns. The hosts know TIDAL IDs, not the catalog's own, so a
+     * catalog track is mapped to its TIDAL ID through its ISRC first.
+     */
+    async *hifiSources(id, quality, track, _prepared, yieldNew) {
         try {
-            const lookup = await this.getTrack(id, quality);
+            const tidalId = await this.resolveTidalTrackId(id, track);
+            if (!tidalId) {
+                console.warn(`No TIDAL track found for ${id}, skipping the HiFi hosts`);
+                return;
+            }
+            const lookup = await this.getTrack(tidalId, quality);
             let url = lookup?.originalTrackUrl || null;
             if (!url && lookup?.info?.manifest) {
                 url = this.extractStreamUrlFromManifest(lookup.info.manifest);
@@ -3128,36 +3184,30 @@ export class LosslessAPI {
         } catch (error) {
             console.warn(`Streaming API lookup failed for ${id} (${quality}):`, error?.message || error);
         }
+    }
 
-        const isrc = track?.isrc;
-        if (isrc && deezerFallbackSettings.isEnabled()) {
-            const baseUrl = deezerFallbackSettings.getApiBaseUrl().replace(/\/+$/, '');
-            if (baseUrl) {
-                const format = this.getDeezerStreamFormat(quality);
-                yield* yieldNew({
-                    url: `${baseUrl}/stream/?isrc=${encodeURIComponent(isrc)}&format=${encodeURIComponent(format)}`,
-                    playbackType: 'direct',
-                    provider: 'deezer',
-                    quality,
-                    label: 'deezer',
-                });
-            }
-        }
+    /**
+     * The TIDAL track ID for a track, or null. TIDAL IDs pass through; the
+     * catalog's 17-20 digit IDs are mapped through the track's ISRC.
+     */
+    async resolveTidalTrackId(id, track) {
+        const raw = String(id ?? '').replace(/^(?:tracks|mono):(?:track:)?/, '');
+        const isCatalogId = /^\d{17,20}$/.test(raw) || track?.provider === 'tracks';
+        if (!isCatalogId) return raw || null;
 
-        try {
-            const unified = await this.getUnifiedPlaybackStreamUrl(id, quality, { track, intent: 'download' });
-            if (unified?.url) {
-                yield* yieldNew({
-                    url: unified.url,
-                    playbackType: unified.playbackType,
-                    provider: unified.provider || 'unified',
-                    quality: unified.quality || quality,
-                    label: 'unified',
-                });
-            }
-        } catch (error) {
-            console.warn(`Unified playback lookup failed for ${id}:`, error?.message || error);
-        }
+        const isrc = String(track?.isrc || '')
+            .trim()
+            .toUpperCase();
+        if (!isrc) return null;
+        this.tidalIdByIsrc ??= new Map();
+        if (this.tidalIdByIsrc.has(isrc)) return this.tidalIdByIsrc.get(isrc);
+
+        const { items = [] } = await this.searchTracksByIsrc(isrc);
+        const sameIsrc = items.filter((t) => String(t?.isrc || '').toUpperCase() === isrc && t?.id != null);
+        const match = sameIsrc[0] || items.find((t) => t?.id != null) || null;
+        const tidalId = match ? String(match.id) : null;
+        if (tidalId) this.tidalIdByIsrc.set(isrc, tidalId);
+        return tidalId;
     }
 
     async assertUsableMedia(blob) {

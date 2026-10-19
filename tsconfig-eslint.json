@@ -17,6 +17,6 @@
         "skipLibCheck": true,
         "noEmit": true
     },
-    "include": ["**/*.ts", "*.ts", "**/*.js", "*.js", "desktop/**/*.cjs", "mcp/**/*.mjs"],
+    "include": ["**/*.ts", "*.ts", "**/*.js", "*.js", "desktop/**/*.cjs", "mcp/**/*.mjs", "scripts/**/*.mjs"],
     "exclude": ["**/node_modules/*"]
 }

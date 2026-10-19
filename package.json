@@ -19,6 +19,7 @@
         "desktop": "vite build && electron .",
         "desktop:dist": "vite build && electron-builder --config desktop/electron-builder.json",
         "mcp": "node mcp/server.mjs",
+        "bench:hosts": "node scripts/bench-hosts.mjs",
         "lint:js": "eslint .",
         "lint:css": "stylelint \"**/*.css\"",
         "lint:html": "htmlhint \"**/*.html\" --ignore=\"dist/**,legacy/**,node_modules/**\"",
