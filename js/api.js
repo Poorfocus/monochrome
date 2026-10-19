@@ -3255,6 +3255,15 @@ export class LosslessAPI {
 
         const { onProgress, track: inputTrack, calculateDashBytes = true } = options;
 
+        // Where the time goes, logged once per track as "[timing] ...".
+        const timing = { start: performance.now(), enrich: 0, download: 0, convert: 0, tag: 0 };
+        let mark = timing.start;
+        const lap = (name) => {
+            const now = performance.now();
+            timing[name] += now - mark;
+            mark = now;
+        };
+
         let prefetchPromises = null;
 
         try {
@@ -3291,6 +3300,7 @@ export class LosslessAPI {
                 };
             }
 
+            lap('enrich');
             const seenUrls = new Set();
             const qualities = isVideo ? [downloadQuality] : this.getDownloadQualityLadder(downloadQuality);
             let blob = null;
@@ -3351,10 +3361,12 @@ export class LosslessAPI {
             if (!blob) {
                 throw lastDownloadError || new Error('Could not resolve stream URL');
             }
+            lap('download');
 
             if (!isVideo) {
                 blob = await applyAudioPostProcessing(blob, quality, onProgress, options.signal, postProcessingQuality);
             }
+            lap('convert');
 
             // Add metadata if track information is provided
             if (enrichedTrack) {
@@ -3385,6 +3397,11 @@ export class LosslessAPI {
                     console.error(err);
                 }
             }
+            lap('tag');
+            const seconds = (ms) => (ms / 1000).toFixed(1);
+            console.log(
+                `[timing] ${id} total ${seconds(performance.now() - timing.start)}s: lookup ${seconds(timing.enrich)}s, fetch ${seconds(timing.download)}s (${(blob.size / 1048576).toFixed(1)} MB), convert ${seconds(timing.convert)}s, tag ${seconds(timing.tag)}s`
+            );
 
             if (options.triggerDownload ?? true) {
                 // Detect actual format and fix filename extension if needed

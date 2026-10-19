@@ -19,9 +19,9 @@ async function makeCoverUrl() {
     return URL.createObjectURL(blob);
 }
 
-function fakeApi(coverUrl, { failures = {} } = {}) {
+function fakeApi(coverUrl, { failures = {}, trackMs = 40 } = {}) {
     // failures: { trackId: number of times downloadTrack should fail before it works }
-    const state = { running: 0, maxRunning: 0, order: [], attempts: {} };
+    const state = { running: 0, maxRunning: 0, order: [], attempts: {}, runningAtStart: {} };
     return {
         state,
         getCoverUrl: () => coverUrl,
@@ -31,8 +31,9 @@ function fakeApi(coverUrl, { failures = {} } = {}) {
             if (state.attempts[id] <= (failures[id] || 0)) throw new Error('Download failed: Fetch failed: 502');
             state.running++;
             state.maxRunning = Math.max(state.maxRunning, state.running);
+            state.runningAtStart[id] = state.running;
             state.order.push(id);
-            await new Promise((r) => setTimeout(r, 40));
+            await new Promise((r) => setTimeout(r, trackMs));
             state.running--;
             return new Blob([FLAC], { type: 'audio/flac' });
         },
@@ -77,6 +78,7 @@ describe('queued album downloads', () => {
         modernSettings.bulkDownloadFolder = root;
         modernSettings.folderTemplate = '{albumTitle} - {albumArtist}';
         modernSettings.filenameTemplate = '{trackNumber} - {artist} - {title}';
+        modernSettings.downloadConcurrency = 1;
         await modernSettings.waitPending();
     });
 
@@ -193,6 +195,57 @@ describe('queued album downloads', () => {
             expect(api.state.attempts['r3-1']).toBe(attemptsBefore);
             expect(jobFor('Broken Album').status).toBe('failed');
             removeDownloadJob(job.id);
+        }, 30000);
+    });
+
+    describe('downloading several tracks at once', () => {
+        const jobFor = (title) => getDownloadJobs().find((j) => j.title === title);
+
+        test('tracks overlap but the saved files and playlist order match a sequential run', async () => {
+            modernSettings.downloadConcurrency = 3;
+            await modernSettings.waitPending();
+            const api = fakeApi(await makeCoverUrl(), { trackMs: 150 });
+            const rec = album('p1', 'Parallel Album', 'Parallel Artist', 6);
+            await downloadAlbum(rec.meta, rec.tracks, api, 'LOSSLESS');
+
+            await vi.waitFor(() => expect(jobFor('Parallel Album')?.status).toBe('done'), {
+                timeout: 20000,
+                interval: 50,
+            });
+            expect(api.state.maxRunning).toBe(3);
+
+            const dir = await root.getDirectoryHandle('Parallel Album - Parallel Artist');
+            const files = await listFiles(dir);
+            expect(files.filter((f) => f.endsWith('.flac'))).toEqual(
+                [1, 2, 3, 4, 5, 6].map((n) => `0${n} - Parallel Artist - Song ${n}.flac`)
+            );
+            const m3u = await (await (await dir.getFileHandle(files.find((f) => f.endsWith('.m3u')))).getFile()).text();
+            const listed = m3u.split('\n').filter((l) => l.endsWith('.flac'));
+            expect(listed).toEqual([1, 2, 3, 4, 5, 6].map((n) => `0${n} - Parallel Artist - Song ${n}.flac`));
+            expect(jobFor('Parallel Album').items.map((i) => i.path)).toEqual(
+                [1, 2, 3, 4, 5, 6].map(
+                    (n) => `Parallel Album - Parallel Artist/0${n} - Parallel Artist - Song ${n}.flac`
+                )
+            );
+        }, 30000);
+
+        test('after a failure the rest of the album downloads one at a time and still completes', async () => {
+            setRetryTiming({ inlineBaseMs: 20, inlineRounds: 3, autoBaseMs: 100, autoMaxMs: 300 });
+            modernSettings.downloadConcurrency = 3;
+            await modernSettings.waitPending();
+            const api = fakeApi(await makeCoverUrl(), { failures: { 'p2-2': 1 }, trackMs: 100 });
+            const rec = album('p2', 'Careful Album', 'Careful Artist', 6);
+            await downloadAlbum(rec.meta, rec.tracks, api, 'LOSSLESS');
+
+            await vi.waitFor(() => expect(jobFor('Careful Album')?.status).toBe('done'), {
+                timeout: 20000,
+                interval: 50,
+            });
+            // Tracks 5 and 6 started after the failure was seen, so ran alone.
+            expect(api.state.runningAtStart['p2-5']).toBe(1);
+            expect(api.state.runningAtStart['p2-6']).toBe(1);
+            const dir = await root.getDirectoryHandle('Careful Album - Careful Artist');
+            expect((await listFiles(dir)).filter((f) => f.endsWith('.flac'))).toHaveLength(6);
         }, 30000);
     });
 });

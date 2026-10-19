@@ -265,6 +265,9 @@ export const modernSettings = new ModernSettings()
         },
     })
     .addProperty('writeArtistsSeparately', false)
+    .addProperty('downloadConcurrency', 3, {
+        getter: (stored) => Math.min(6, Math.max(1, Math.round(Number(stored)) || 3)),
+    })
     .addProperty('keepDownloadHistory', true)
     .addProperty('showDownloadPopups', true)
     .finalize() as ModernSettings & {
@@ -295,6 +298,9 @@ export const modernSettings = new ModernSettings()
 
     /** Whether to write multiple artists to downloaded files */
     writeArtistsSeparately: boolean;
+
+    /** How many tracks of one album download at the same time (1-6) */
+    downloadConcurrency: number;
 
     /** Whether finished downloads stay listed on the Downloads page after a reload */
     keepDownloadHistory: boolean;

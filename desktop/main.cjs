@@ -386,7 +386,8 @@ function logPageConsole(webContents) {
     }
     webContents.on('console-message', (event) => {
         const level = event.level;
-        if (level !== 'warning' && level !== 'error') return;
+        // Warnings, errors, and the per-track "[timing]" lines from downloads.
+        if (level !== 'warning' && level !== 'error' && !event.message.startsWith('[timing]')) return;
         const line = `${new Date().toISOString()} [${level}] ${event.message}${event.sourceId ? ` (${event.sourceId}:${event.lineNumber})` : ''}\n`;
         fs.appendFile(logFile, line, () => {});
     });

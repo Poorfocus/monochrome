@@ -628,36 +628,56 @@ async function downloadTrackBlob(track, quality, api, signal = null, onProgress 
 }
 
 /**
- * Downloads one track and yields its audio file plus lyrics files, reporting
- * to the download manager item `index` of `jobId`. Returns the path used in
- * playlist files (disc folder + filename).
+ * Fetches one track's audio, reporting progress and speed to the download
+ * manager item `itemIndex` of `jobId`. This is the slow part of a track and
+ * can run for several tracks at once; writing happens in {@link emitTrackFiles}.
  */
-async function* downloadTrackFiles({
-    track,
-    index,
-    itemIndex = index,
-    quality,
-    api,
-    signal,
-    lyricsManager,
-    folderPath,
-    discLayout,
-    sequenceNumber = null,
-    jobId,
-    onProgress = null,
-}) {
+async function fetchTrack({ track, itemIndex, quality, api, signal, jobId, onProgress = null }) {
     updateDownloadItem(jobId, itemIndex, {
         status: 'downloading',
         progress: 0,
         error: undefined,
         statusText: undefined,
+        speed: undefined,
     });
 
+    const startedAt = performance.now();
+    let lastSpeedUpdate = 0;
     const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, (p) => {
         const fraction = progressFraction(p);
-        if (fraction !== null) updateDownloadItem(jobId, itemIndex, { progress: Math.min(fraction, 0.99) });
+        if (fraction !== null) {
+            const patch = { progress: Math.min(fraction, 0.99) };
+            // Speed of the stream so far, refreshed about twice a second.
+            const now = performance.now();
+            if (p?.receivedBytes && now - lastSpeedUpdate > 500) {
+                lastSpeedUpdate = now;
+                patch.speed = p.receivedBytes / ((now - startedAt) / 1000);
+            }
+            updateDownloadItem(jobId, itemIndex, patch);
+        }
         onProgress?.(p, fraction);
     });
+    return { blob, extension };
+}
+
+/**
+ * Yields a fetched track's audio file plus lyrics files and marks its
+ * manager item done once the writer has saved it. Returns the path used in
+ * playlist files (disc folder + filename).
+ */
+async function* emitTrackFiles({
+    track,
+    index,
+    itemIndex = index,
+    fetched,
+    quality,
+    lyricsManager,
+    folderPath,
+    discLayout,
+    sequenceNumber = null,
+    jobId,
+}) {
+    const { blob, extension } = fetched;
     const filename = buildTrackFilename(track, quality, extension, sequenceNumber);
     const separateByDisc = discLayout.separateByDisc;
     const discNumber = discLayout.resolveDiscNumber(index);
@@ -665,7 +685,13 @@ async function* downloadTrackFiles({
     const entryName = buildZipTrackPath(folderPath, filename, separateByDisc, discNumber);
 
     yield { name: entryName, lastModified: new Date(), input: blob };
-    updateDownloadItem(jobId, itemIndex, { status: 'done', progress: 1, bytes: blob.size, path: entryName });
+    updateDownloadItem(jobId, itemIndex, {
+        status: 'done',
+        progress: 1,
+        bytes: blob.size,
+        path: entryName,
+        speed: undefined,
+    });
 
     if (lyricsManager && lyricsSettings.shouldDownloadLyrics()) {
         try {
@@ -696,6 +722,66 @@ async function* downloadTrackFiles({
     }
 
     return discPath;
+}
+
+/** Fetches and emits one track, one after the other (used for retries). */
+async function* downloadTrackFiles(args) {
+    const withItem = { ...args, itemIndex: args.itemIndex ?? args.index };
+    const fetched = await fetchTrack(withItem);
+    return yield* emitTrackFiles({ ...withItem, fetched });
+}
+
+/**
+ * Downloads `indices` with up to `concurrency()` fetches in flight at once,
+ * but hands finished tracks to the writer in order, one at a time, so the
+ * output is the same as a sequential run. At most `concurrency()` tracks are
+ * fetched or waiting to be written at any moment, which bounds memory.
+ *
+ * `fetchOne(i)` fetches track i, `emitOne(i, fetched)` is a generator that
+ * writes it, `isSaved(i)` says the track needs no download. Returns the
+ * indices that failed (after calling `onFailure(i, error)`). After the first
+ * failure the rest of the run is sequential: if the host is struggling,
+ * piling more requests on it only makes things worse.
+ */
+async function* downloadTracksInOrder(indices, { concurrency, fetchOne, emitOne, isSaved, onFailure, signal }) {
+    const failed = [];
+    const started = new Map(); // index -> promise of { fetched } | { error } | { saved }
+    let next = 0;
+    let limit = Math.max(1, concurrency());
+
+    const startMore = (consumed) => {
+        while (next < indices.length && next - consumed < limit && !signal.aborted) {
+            const i = indices[next++];
+            started.set(
+                i,
+                isSaved(i)
+                    ? Promise.resolve({ saved: true })
+                    : fetchOne(i).then(
+                          (fetched) => ({ fetched }),
+                          (error) => ({ error })
+                      )
+            );
+        }
+    };
+
+    startMore(0);
+    for (let position = 0; position < indices.length; position++) {
+        if (signal.aborted) break;
+        const i = indices[position];
+        const result = await started.get(i);
+        started.delete(i);
+
+        if (result.error) {
+            if (result.error?.name === 'AbortError' || signal.aborted) throw result.error;
+            onFailure(i, result.error);
+            failed.push(i);
+            limit = 1;
+        } else {
+            yield* emitOne(i, result.fetched, Boolean(result.saved));
+        }
+        startMore(position + 1);
+    }
+    return failed;
 }
 
 async function bulkDownload({
@@ -778,18 +864,84 @@ async function bulkDownload({
             }
         }
 
-        const failedIndices = [];
-        for (let i = 0; i < tracks.length; i++) {
-            if (signal.aborted) break;
-            if (!(yield* runTrack(i))) {
-                failedIndices.push(i);
-                const statusEl = notification.querySelector('.download-status');
-                if (statusEl) {
-                    statusEl.textContent = `${Math.floor(i + 1)}/${tracks.length} · ${failedIndices.length} failed`;
-                    statusEl.style.color = '#f59e0b';
-                }
+        // First pass: several tracks are fetched at once, written in order (see downloadTracksInOrder).
+        const inFlight = new Map(); // track index -> fraction fetched
+        let finished = 0;
+        const showProgress = (p) => {
+            const [first] = inFlight.keys();
+            const partial = [...inFlight.values()].reduce((sum, fraction) => sum + Math.min(fraction, 0.99), 0);
+            const title = first === undefined ? '' : getTrackTitle(tracks[first]);
+            updateBulkDownloadProgress(notification, finished + partial, tracks.length, title, p);
+        };
+
+        const failedIndices = yield* downloadTracksInOrder(
+            tracks.map((_, i) => i),
+            {
+                signal,
+                concurrency: () => modernSettings.downloadConcurrency,
+                isSaved: (i) => alreadySaved?.has(String(tracks[i].id)) ?? false,
+                fetchOne: (i) => {
+                    inFlight.set(i, 0);
+                    return fetchTrack({
+                        track: tracks[i],
+                        itemIndex: i,
+                        quality,
+                        api,
+                        signal,
+                        jobId,
+                        onProgress: (p, fraction) => {
+                            if (inFlight.has(i)) inFlight.set(i, fraction ?? inFlight.get(i));
+                            showProgress(p);
+                        },
+                    });
+                },
+                async *emitOne(i, fetched, saved) {
+                    const track = tracks[i];
+                    if (saved) {
+                        // Saved by an earlier run of this job: keep it, but list it in playlist files.
+                        const savedPath = alreadySaved.get(String(track.id));
+                        trackPaths[i] = relativeToFolder(savedPath, folderName);
+                        updateDownloadItem(jobId, i, { status: 'done', progress: 1, path: savedPath });
+                    } else {
+                        // Playlists/queues/liked lists mix tracks from many albums, so use
+                        // the list sequence; albums/discographies keep album numbers.
+                        const sequenceNumber =
+                            type === 'playlist' || type === 'queue' || type === 'liked' ? i + 1 : null;
+                        trackPaths[i] = yield* emitTrackFiles({
+                            track,
+                            index: i,
+                            fetched,
+                            quality,
+                            lyricsManager,
+                            folderPath: folderName,
+                            discLayout,
+                            sequenceNumber,
+                            jobId,
+                        });
+                    }
+                    inFlight.delete(i);
+                    finished++;
+                    showProgress();
+                },
+                onFailure: (i, err) => {
+                    inFlight.delete(i);
+                    if (!stats.firstError) stats.firstError = err?.message || String(err);
+                    console.error(`Failed to download track ${getTrackTitle(tracks[i])}:`, err);
+                    updateDownloadItem(jobId, i, {
+                        status: 'failed',
+                        progress: 0,
+                        error: err?.message || String(err),
+                        statusText: undefined,
+                        speed: undefined,
+                    });
+                    const statusEl = notification.querySelector('.download-status');
+                    if (statusEl) {
+                        statusEl.textContent = `${tracks.length - finished - inFlight.size} left · a track failed, retrying`;
+                        statusEl.style.color = '#f59e0b';
+                    }
+                },
             }
-        }
+        );
 
         // Every source was already tried for these; retry them in rounds with growing pauses.
         // Whatever still fails is retried by a later run of this job (see settleJob).
@@ -1355,18 +1507,64 @@ export async function downloadDiscography(
                     }
                 }
 
-                const failedIndices = [];
-                for (let i = 0; i < tracks.length; i++) {
-                    if (signal.aborted) break;
-                    if (!(yield* runTrack(i))) {
-                        failedIndices.push(i);
-                        const statusEl = notification.querySelector('.download-status');
-                        if (statusEl) {
-                            statusEl.textContent = `${album.title} · ${stats.failed + failedIndices.length} failed`;
-                            statusEl.style.color = '#f59e0b';
-                        }
+                // First pass: several tracks are fetched at once, written in order (see downloadTracksInOrder).
+                const failedIndices = yield* downloadTracksInOrder(
+                    tracks.map((_, i) => i),
+                    {
+                        signal,
+                        concurrency: () => modernSettings.downloadConcurrency,
+                        isSaved: (i) => alreadySaved?.has(String(tracks[i].id)) ?? false,
+                        fetchOne: (i) =>
+                            fetchTrack({
+                                track: tracks[i],
+                                itemIndex: firstItem + i,
+                                quality,
+                                api,
+                                signal,
+                                jobId,
+                            }),
+                        async *emitOne(i, fetched, saved) {
+                            const track = tracks[i];
+                            if (saved) {
+                                const savedPath = alreadySaved.get(String(track.id));
+                                trackPaths[i] = relativeToFolder(savedPath, fullFolderPath);
+                                updateDownloadItem(jobId, firstItem + i, {
+                                    status: 'done',
+                                    progress: 1,
+                                    path: savedPath,
+                                });
+                            } else {
+                                trackPaths[i] = yield* emitTrackFiles({
+                                    track,
+                                    index: i,
+                                    itemIndex: firstItem + i,
+                                    fetched,
+                                    quality,
+                                    lyricsManager,
+                                    folderPath: fullFolderPath,
+                                    discLayout,
+                                    jobId,
+                                });
+                            }
+                        },
+                        onFailure: (i, err) => {
+                            if (!stats.firstError) stats.firstError = err?.message || String(err);
+                            console.error(`Failed to download track ${tracks[i].title}:`, err);
+                            updateDownloadItem(jobId, firstItem + i, {
+                                status: 'failed',
+                                progress: 0,
+                                error: err?.message || String(err),
+                                statusText: undefined,
+                                speed: undefined,
+                            });
+                            const statusEl = notification.querySelector('.download-status');
+                            if (statusEl) {
+                                statusEl.textContent = `${album.title} · a track failed, retrying`;
+                                statusEl.style.color = '#f59e0b';
+                            }
+                        },
                     }
-                }
+                );
                 if (failedIndices.length > 0 && !signal.aborted) {
                     yield* retryFailedTracks(failedIndices, runTrack, { signal, jobId, itemOffset: firstItem });
                 }

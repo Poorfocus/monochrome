@@ -57,6 +57,8 @@ export interface DownloadItem {
     progress: number;
     statusText?: string;
     bytes?: number;
+    /** Current fetch speed in bytes per second while downloading. */
+    speed?: number;
     /** Path of the saved file relative to the destination root. */
     path?: string;
     error?: string;

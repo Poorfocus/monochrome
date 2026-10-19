@@ -269,7 +269,14 @@ export class DesktopFolderWriter implements IBulkDownloadWriter {
             } else {
                 data = await input.arrayBuffer();
             }
+            const started = performance.now();
             await desktop.writeFile(file.name, data);
+            const size = typeof data === 'string' ? data.length : data.byteLength;
+            if (size > 100_000) {
+                console.log(
+                    `[timing] write ${file.name} ${(size / 1048576).toFixed(1)} MB in ${((performance.now() - started) / 1000).toFixed(2)}s`
+                );
+            }
         }
     }
 }
