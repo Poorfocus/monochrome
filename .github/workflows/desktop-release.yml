@@ -2,6 +2,9 @@ name: Desktop Release
 
 on:
     workflow_dispatch:
+    # Push a tag such as desktop-v2.5.1 to build and publish a release for it.
+    push:
+        tags: ['desktop-v*']
 
 permissions:
     contents: write
@@ -33,6 +36,7 @@ jobs:
               run: |
                   $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
                   $tag = "desktop-v$version.${{ github.run_number }}"
+                  if ("${{ github.ref_type }}" -eq 'tag') { $tag = "${{ github.ref_name }}" }
                   $files = Get-ChildItem release -Filter *.exe | ForEach-Object { $_.FullName }
                   if (-not $files) { throw 'No .exe files were built' }
                   gh release create $tag @files `
